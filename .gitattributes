@@ -1,0 +1,9 @@
+# This is a C application for the Flipper Zero.
+# Force the source to count toward GitHub's language stats.
+*.c linguist-language=C linguist-detectable=true linguist-generated=false linguist-vendored=false
+*.h linguist-language=C linguist-detectable=true
+
+# Keep build tooling / CI / docs out of the language bar.
+Makefile linguist-detectable=false
+*.yml    linguist-detectable=false
+*.md     linguist-detectable=false
