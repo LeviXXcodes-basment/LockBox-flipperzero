@@ -1,9 +1,9 @@
-# CardVault — convenience wrappers around ufbt
+# LockBox - convenience wrappers around ufbt
 # Requires: pip install ufbt
 
 .PHONY: build launch clean update format
 
-build:        ## Build dist/cardvault.fap
+build:        ## Build dist/lockbox.fap
 	ufbt
 
 launch:       ## Build, upload and run on a connected Flipper
@@ -17,4 +17,4 @@ clean:        ## Remove build artifacts
 	rm -rf dist build .ufbt/build
 
 format:       ## Format the source with clang-format (if available)
-	clang-format -i cardvault.c || true
+	clang-format -i lockbox.c || true

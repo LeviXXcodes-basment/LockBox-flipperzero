@@ -1,93 +1,55 @@
-# 🔐 CardVault
+# LockBox
 
-[![Build FAP](https://github.com/LeviXXcodes-basment/CardVault/actions/workflows/build.yml/badge.svg)](https://github.com/LeviXXcodes-basment/CardVault/actions/workflows/build.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Flipper Zero](https://img.shields.io/badge/Flipper%20Zero-Momentum-orange)](https://momentum-fw.dev)
+A PIN-protected, **device-bound** vault app for the [Flipper Zero](https://flipperzero.one/).
+LockBox encrypts your saved **NFC**, **RFID** and **SubGHz** files — plus free-form
+**Secure Notes** — so a stolen SD card or a copied file is useless on any other device.
 
-A **PIN-protected, device-bound vault** for your saved **NFC** and **RFID** cards — plus encrypted **secure notes / passwords** — for the Flipper Zero.
+> Author: **LeviXX**
 
-CardVault moves your saved cards off the open file system and into an encrypted vault that **only this Flipper, with the correct PIN, can open**.
+## Features
 
----
+- **Encrypt NFC / RFID / SubGHz** — pick a file; it is encrypted into the vault
+  (`.lbx`) and removed from its original app.
+- **My Vault** — list stored items, decrypt (restore) them back to their app, or delete.
+- **Secure Notes** — store text/passwords, encrypted the same way.
+- **Direction-button PIN** — Up/Down/Left/Right/Back sequence, like the Momentum lock code.
+- **Brute-force lockout** — escalating timeout after wrong PINs (30s → 60s → 120s →
+  5 min → 10 min), persisted across restarts.
+- **Change PIN** with optional re-encryption of every stored item under the new key.
 
-## 📸 Screenshots
+## Security model
 
-<p align="center">
-  <img src="screenshots/pin.png" width="30%" alt="PIN unlock screen">
-  <img src="screenshots/menu-top.png" width="30%" alt="Main menu with live card count">
-  <img src="screenshots/my-vault.png" width="30%" alt="My Vault list">
-</p>
-<p align="center">
-  <img src="screenshots/secure-notes.png" width="30%" alt="Secure Notes list">
-  <img src="screenshots/menu-bottom.png" width="30%" alt="Main menu (Secure Notes, Change PIN, About)">
-</p>
+- The encryption key is **never stored**. It is derived from **this Flipper's unique
+  hardware serial (UID) + your PIN**, run through a slow SHA-256 KDF (8000 rounds)
+  with a random per-file salt.
+- Cipher: SHA-256 keystream (hash-CTR) — a real cryptographic primitive, not plain XOR.
+- Because the key needs **both** the device serial (not on the SD card) **and** the PIN,
+  a copied `.lbx` file cannot be decrypted off this device or without the PIN.
+- The PIN itself is stored only as a hash (`pin.dat`); changing it re-keys the vault.
 
----
+> Decrypt your cards and notes **before** changing the PIN if you skip re-encryption.
 
-## ✨ Features
+## Build & install
 
-- **4-digit PIN gate** — set on first launch, required every time.
-- **Encrypt cards into the vault** — pick a `.nfc` or `.rfid` file; it is encrypted and the **original is removed** from its app.
-- **My Vault** — browse your stored cards with a live count; **decrypt (restore)** or **delete** any of them.
-- **Secure Notes** — store text and passwords, encrypted the same way. View or delete.
-- **Device-bound encryption** — see the security model below.
-
-## 🔒 Security model
-
-- The encryption key is **derived, never stored**: it comes from **this Flipper's unique hardware serial (UID) + your PIN**, run through a slow **SHA-256** key-derivation (8000 rounds) with a **random per-file salt**.
-- Cipher: **SHA-256 keystream** (hash-CTR) — a real cryptographic primitive, not a toy XOR.
-- Because the key needs **both** the device serial (which is **not** on the SD card) **and** the PIN, a copied `.cvx` file **cannot be decrypted** on another Flipper or without the correct PIN.
-- A `CVT1` magic header verifies the key on decrypt, so a wrong PIN fails cleanly instead of writing garbage.
-
-> ⚠️ **Important:** changing the PIN **re-keys** everything. **Decrypt your cards and notes before changing the PIN**, or you will not be able to recover them.
->
-> This protects against SD-card extraction and cloning. It is **not** designed to resist an attacker who has physical access to *this* Flipper and reverse-engineers it. Keep your device and PIN private.
-
----
-
-## 📦 Install
-
-### Option A — download the release
-1. Grab `cardvault.fap` from the [latest release](https://github.com/LeviXXcodes-basment/CardVault/releases/latest).
-2. Copy it to your Flipper SD card under `apps/Tools/`.
-3. Launch it from **Apps → Tools → CardVault**.
-
-### Option B — build it yourself
-Requires [`ufbt`](https://pypi.org/project/ufbt/):
+Built with [ufbt](https://pypi.org/project/ufbt/) (micro Flipper Build Tool):
 
 ```bash
 pip install ufbt
-ufbt update --channel=release        # first time only
-git clone https://github.com/LeviXXcodes-basment/CardVault.git
-cd CardVault
-ufbt            # builds dist/cardvault.fap
-ufbt launch     # build + upload + run on a connected Flipper
+ufbt            # build -> dist/lockbox.fap
+ufbt launch     # build, install to the connected Flipper, and launch
 ```
 
----
+The app appears on the device under **Apps → Tools → LockBox**.
 
-## 🕹️ Usage
+## Files
 
-1. **First launch:** set a 4-digit PIN (enter it twice).
-2. **Later launches:** enter your PIN to unlock.
-3. **Encrypt NFC Card / Encrypt RFID Tag** — pick a saved card; it moves into the vault, encrypted.
-4. **My Vault** — see stored cards; open one to **Decrypt (restore)** or **Delete**.
-5. **Secure Notes** — add encrypted notes/passwords; open one to **View** or **Delete**.
-6. **Change PIN** — remember to decrypt your items first.
+| Path | Purpose |
+|------|---------|
+| `application.fam` | App manifest (id, name, icon, metadata) |
+| `lockbox.c` | Full app source (SHA-256, PIN view, vault, notes, lockout) |
+| `lockbox_icon.png` | 10×10 app icon |
+| `images/` | Icon assets |
 
-**PIN screen controls:** Up/Down change the digit, Left/Right move between digits, OK confirms.
-
----
-
-## 🛠️ Built with
-
-- [Momentum Firmware](https://momentum-fw.dev) (MNTM) SDK via `ufbt`
-- Pure C, a single self-contained source file, with an embedded SHA-256 implementation
-
-## 📄 License
+## License
 
 MIT — see [LICENSE](LICENSE).
-
-## 🙋 Author
-
-**LeviXX** · built with help from Claude.

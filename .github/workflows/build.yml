@@ -32,14 +32,14 @@ jobs:
       - name: Locate built .fap
         id: fap
         run: |
-          FAP=$(find .ufbt dist -name 'cardvault.fap' 2>/dev/null | head -n1)
+          FAP=$(find .ufbt dist -name 'lockbox.fap' 2>/dev/null | head -n1)
           echo "path=$FAP" >> "$GITHUB_OUTPUT"
           echo "Built: $FAP"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cardvault-fap
+          name: lockbox-fap
           path: ${{ steps.fap.outputs.path }}
           if-no-files-found: error
 

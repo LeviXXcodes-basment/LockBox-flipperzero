@@ -1,6 +1,6 @@
-# Contributing to CardVault
+# Contributing to LockBox
 
-Thanks for your interest! CardVault is a small, single-file Flipper Zero app.
+Thanks for your interest! LockBox is a small, single-file Flipper Zero app.
 
 ## Building
 
@@ -13,8 +13,8 @@ ufbt launch     # build + run on a connected Flipper
 
 ## Guidelines
 
-- Keep it **one source file** (`cardvault.c`) where reasonable.
-- The firmware compiles with **warnings-as-errors** — no unused variables, and
+- Keep it **one source file** (`lockbox.c`) where reasonable.
+- The firmware compiles with **warnings-as-errors** - no unused variables, and
   watch `snprintf` buffer sizes (format-truncation is an error).
 - Don't weaken the security model without discussion. In particular:
   - the encryption key must stay **derived** (device UID + PIN), never written to disk;

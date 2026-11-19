@@ -1,54 +1,51 @@
-# CardVault — feltöltés GitHubra (magyar útmutató)
+# LockBox — GitHub és kiadás (magyar útmutató)
 
-Ez a repó mappája. Így teszed fel a saját GitHub-fiókodba és adod ki az 1.1-et.
+Ez a repó mappája. Az alap beállítás már kész; itt az látszik, hogyan frissíts
+és hogyan adj ki egy új verziót.
 
-## 1. Repó létrehozása GitHubon
-- Menj a https://github.com/new oldalra.
-- Repository name: **CardVault**
-- Public, **NE** pipáld be a "Add a README" opciót (nálunk már van).
-- Create repository.
+## Build helyben
 
-## 2. A helyi mappa feltöltése
-A `CardVault` mappában (ahol az `application.fam` is van), PowerShellben:
+A `lockbox` mappában (ahol az `application.fam` is van), PowerShellben:
 
 ```powershell
-git init
-git add .
-git commit -m "CardVault v1.1
-
-Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01FvmXmKoLAtfZBGbrN75Enu"
-git branch -M main
-git remote add origin https://github.com/LeviXXcodes-basment/CardVault.git
-git push -u origin main
+pip install ufbt
+ufbt            # build -> dist/lockbox.fap
+ufbt launch     # build + feltöltés a csatlakoztatott Flipperre
 ```
 
-> Ha a `git` nevet/emailt kér először:
-> ```powershell
-> git config --global user.name "LeviXX"
-> git config --global user.email "a-github-emailed@pelda.hu"
-> ```
-
-## 3. Kiadás (release) — ez építi meg a .fap-ot és csatolja
-A GitHub Actions a `v`-vel kezdődő tag-re lefordítja a `cardvault.fap`-ot és felteszi a release-hez:
+## Változás feltöltése
 
 ```powershell
-git tag v1.1
-git push origin v1.1
+git add -A
+git commit -m "Rövid leírás a változásról"
+git push
 ```
 
-Pár perc múlva a repó **Releases** fülén ott lesz a `cardvault.fap`, letölthetően.
+## Kiadás (release) — ez építi meg a .fap-ot és csatolja
 
-## 4. Build-állapot
-A README tetején a zöld **Build FAP** jelvény mutatja, hogy fordul-e a kód. Az **Actions** fülön látod a logokat.
+A GitHub Actions a `v`-vel kezdődő tagre lefordítja a `lockbox.fap`-ot és
+felteszi a release-hez (`.github/workflows/build.yml`):
+
+```powershell
+git tag v2.0.0
+git push origin v2.0.0
+```
+
+Pár perc múlva a repó **Releases** fülén ott lesz a `lockbox.fap`, letölthetően.
+
+## Build-állapot
+
+A README tetején a zöld **Build FAP** jelvény mutatja, hogy fordul-e a kód.
+Az **Actions** fülön látod a logokat.
 
 ## Fájlszerkezet
+
 ```
-CardVault/
+lockbox/
 ├── application.fam
-├── cardvault.c
+├── lockbox.c
+├── lockbox_icon.png
 ├── images/
-│   └── cardvault_icon.png
 ├── README.md
 ├── LICENSE
 ├── CONTRIBUTING.md
