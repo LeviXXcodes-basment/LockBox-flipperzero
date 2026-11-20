@@ -28,21 +28,30 @@
 #include <dialogs/dialogs.h>
 #include <notification/notification_messages.h>
 
-#define APP_VERSION "v2.0"
+#define APP_VERSION "v2.1"
 
 #define LOCKBOX_DIR      "/ext/apps_data/lockbox"
 #define LOCKBOX_PIN_PATH  "/ext/apps_data/lockbox/pin.dat"
 #define LOCKBOX_LOCK_PATH "/ext/apps_data/lockbox/lock.dat"
+#define LOCKBOX_CFG_PATH  "/ext/apps_data/lockbox/cfg.dat"
 #define LOCKOUT_START_FAILS 2 /* ennyi rossz probalkozas utan jon az elso timeout */
-#define LOCKBOX_NFC_DIR    "/ext/apps_data/lockbox/nfc"
-#define LOCKBOX_RFID_DIR   "/ext/apps_data/lockbox/rfid"
-#define LOCKBOX_SUBGHZ_DIR "/ext/apps_data/lockbox/subghz"
-#define LOCKBOX_NOTES_DIR  "/ext/apps_data/lockbox/notes"
+#define PANIC_WIPE_MIN     3  /* a panic-wipe kuszob also hatara */
+#define PANIC_WIPE_MAX     20 /* a panic-wipe kuszob felso hatara */
+#define PANIC_WIPE_DEFAULT 10 /* alap panic-wipe kuszob */
+#define LOCKBOX_CFG_MAGIC  0x4C425347u /* "LBSG" - config fajl fejlec */
+#define LOCKBOX_NFC_DIR      "/ext/apps_data/lockbox/nfc"
+#define LOCKBOX_RFID_DIR     "/ext/apps_data/lockbox/rfid"
+#define LOCKBOX_SUBGHZ_DIR   "/ext/apps_data/lockbox/subghz"
+#define LOCKBOX_IBTN_DIR     "/ext/apps_data/lockbox/ibutton"
+#define LOCKBOX_INFRARED_DIR "/ext/apps_data/lockbox/infrared"
+#define LOCKBOX_NOTES_DIR    "/ext/apps_data/lockbox/notes"
 #define LOCKBOX_NOTE_TITLE_LEN 40
 #define LOCKBOX_NOTE_TEXT_LEN  512
 #define NFC_SRC_DIR        "/ext/nfc"
 #define RFID_SRC_DIR       "/ext/lfrfid"
 #define SUBGHZ_SRC_DIR     "/ext/subghz"
+#define IBTN_SRC_DIR       "/ext/ibutton"
+#define INFRARED_SRC_DIR   "/ext/infrared"
 /* A PIN mostantol IRANYGOMB-sorozat (Fel/Le/Balra/Jobbra/Vissza), mint a
  * Momentum zarkod. PIN_MAX a max hossz, PIN_MIN a minimum. */
 #define PIN_MAX            10
@@ -181,6 +190,8 @@ typedef enum {
     ViewIdNoteInput,
     ViewIdRecoverPin,
     ViewIdRekey,
+    ViewIdSettings,
+    ViewIdRenameInput,
     ViewIdAbout,
     ViewIdResult,
 } ViewId;
@@ -198,8 +209,11 @@ typedef enum {
     MenuIndexNfc,
     MenuIndexRfid,
     MenuIndexSubghz,
+    MenuIndexIbtn,
+    MenuIndexInfrared,
     MenuIndexVault,
     MenuIndexNotes,
+    MenuIndexSettings,
     MenuIndexChangePin,
     MenuIndexAbout,
 } MenuIndex;
@@ -208,8 +222,17 @@ typedef enum {
 typedef enum {
     ItemActionDecrypt,
     ItemActionOldPin,
+    ItemActionRename,
     ItemActionDelete,
 } ItemAction;
+
+/* ---- Settings almenu elemek ---- */
+typedef enum {
+    SettingsPanicToggle,
+    SettingsPanicLess,
+    SettingsPanicMore,
+    SettingsBack,
+} SettingsAction;
 
 /* ---- Jegyzet-muvelet almenu ---- */
 typedef enum {
@@ -246,6 +269,7 @@ typedef struct {
     bool error;
     bool locked; /* epp zarolva van-e (brute-force vedelem) */
     uint32_t remaining; /* hatralevo masodpercek a zarolasbol */
+    uint32_t anim; /* animacios keptszamlalo (uszkalo delfin) */
 } PinModel;
 
 typedef struct {
@@ -266,10 +290,13 @@ typedef struct {
     TextBox* note_view;
     TextInput* title_input;
     TextInput* note_input;
+    TextInput* rename_input; /* szef-tetel atnevezese */
+    Submenu* settings_menu; /* panic-wipe beallitasok */
 
     FuriTimer* lock_timer; /* a zarolas-visszaszamlalo frissitese */
+    FuriTimer* anim_timer; /* a delfin-animacio frissitese (~100ms) */
 
-    char about_buffer[640];
+    char about_buffer[768];
     char result_buffer[512];
     char menu_header[32];
     bool pin_is_set;
@@ -278,6 +305,10 @@ typedef struct {
     /* Brute-force vedelem (lemezre mentve, hogy ujrainditas ne nullazza) */
     uint32_t fail_count; /* egymas utani rossz PIN-ek szama */
     uint32_t lock_until; /* eddig a RTC-idopontig zarolva (masodperc) */
+
+    /* Panic-wipe: ennyi egymas utani rossz PIN utan torli a szefet (ha be van kapcsolva) */
+    bool panic_enabled;
+    uint32_t panic_threshold;
 
     /* Recovery: regi PIN-nel probalt visszafejtes */
     View* recover_view; /* kulon PIN-pad a regi PIN beviteléhez */
@@ -302,6 +333,10 @@ typedef struct {
     char note_title[LOCKBOX_NOTE_TITLE_LEN]; /* uj jegyzet cime (bevitel) */
     char note_text[LOCKBOX_NOTE_TEXT_LEN]; /* uj jegyzet szovege (bevitel) */
     char note_display[LOCKBOX_NOTE_TEXT_LEN + 128]; /* megtekintett jegyzet (cim+szoveg) */
+
+    /* Atnevezes allapota */
+    char rename_buf[LOCKBOX_NOTE_TITLE_LEN]; /* szerkesztheto nev (tipus-suffix nelkul) */
+    char rename_suffix[16]; /* az eredeti tipus-vegzodes (.nfc/.sub/...) visszafuzeshez */
 } LockBoxApp;
 
 /* ====================================================================== *
@@ -412,6 +447,95 @@ static uint32_t lockbox_lock_seconds(uint32_t fails) {
     if(fails == 4) return 120;
     if(fails == 5) return 300;
     return 600; /* 6+ rossz probalkozas -> 10 perc */
+}
+
+/* A brute-force letra teljes nullazasa (sikeres belepes utan, vagy ha egy
+ * lejart zarolas utan tiszta lappal indulunk). */
+static void lockbox_lock_reset(LockBoxApp* app) {
+    app->fail_count = 0;
+    app->lock_until = 0;
+    lockbox_lock_save(app);
+}
+
+/* ====================================================================== *
+ *                  Beallitasok (panic-wipe) - lemezre mentve             *
+ * ====================================================================== */
+
+static void lockbox_cfg_load(LockBoxApp* app) {
+    app->panic_enabled = false;
+    app->panic_threshold = PANIC_WIPE_DEFAULT;
+    File* f = storage_file_alloc(app->storage);
+    if(storage_file_open(f, LOCKBOX_CFG_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        uint32_t buf[3] = {0, 0, 0};
+        if(storage_file_read(f, buf, sizeof(buf)) == sizeof(buf) && buf[0] == LOCKBOX_CFG_MAGIC) {
+            app->panic_enabled = (buf[1] != 0);
+            uint32_t th = buf[2];
+            if(th < PANIC_WIPE_MIN) th = PANIC_WIPE_MIN;
+            if(th > PANIC_WIPE_MAX) th = PANIC_WIPE_MAX;
+            app->panic_threshold = th;
+        }
+        storage_file_close(f);
+    }
+    storage_file_free(f);
+}
+
+static void lockbox_cfg_save(LockBoxApp* app) {
+    storage_common_mkdir(app->storage, LOCKBOX_DIR);
+    File* f = storage_file_alloc(app->storage);
+    if(storage_file_open(f, LOCKBOX_CFG_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        uint32_t buf[3] = {LOCKBOX_CFG_MAGIC, app->panic_enabled ? 1u : 0u, app->panic_threshold};
+        storage_file_write(f, buf, sizeof(buf));
+        storage_file_close(f);
+    }
+    storage_file_free(f);
+}
+
+/* Egy mappa osszes .lbx fajljanak torlese (panic-wipe). Visszaadja a torolt db-ot.
+ * Keves stacket hasznal: koronkent megkeresi az elso .lbx-et, bezarja a mappat,
+ * torli, majd ujra -> nincs nagy, stacken fekvo nevtomb. */
+static uint32_t lockbox_wipe_dir(LockBoxApp* app, const char* dir) {
+    uint32_t removed = 0;
+    for(uint32_t guard = 0; guard < LOCKBOX_MAX_ITEMS; guard++) {
+        char found[160];
+        found[0] = '\0';
+        File* d = storage_file_alloc(app->storage);
+        if(storage_dir_open(d, dir)) {
+            FileInfo info;
+            char name[160];
+            while(storage_dir_read(d, &info, name, sizeof(name))) {
+                if(info.flags & FSF_DIRECTORY) continue;
+                size_t nlen = strlen(name);
+                if(nlen >= 4 && strcmp(name + nlen - 4, ".lbx") == 0) {
+                    snprintf(found, sizeof(found), "%s", name);
+                    break;
+                }
+            }
+            storage_dir_close(d);
+        }
+        storage_file_free(d);
+        if(found[0] == '\0') break; /* nincs tobb .lbx */
+
+        char path[LOCKBOX_PATH_LEN];
+        snprintf(path, sizeof(path), "%s/%s", dir, found);
+        if(storage_common_remove(app->storage, path) == FSE_OK)
+            removed++;
+        else
+            break; /* ne porogjon vegtelenbe, ha nem torolheto */
+    }
+    return removed;
+}
+
+/* Panic-wipe: minden titkositott tetel torlese a szefbol (NFC/RFID/SubGHz/
+ * iButton/Infrared/Notes). A PIN megmarad, igy a kovetkezo belepes mukodik. */
+static uint32_t lockbox_panic_wipe(LockBoxApp* app) {
+    uint32_t n = 0;
+    n += lockbox_wipe_dir(app, LOCKBOX_NFC_DIR);
+    n += lockbox_wipe_dir(app, LOCKBOX_RFID_DIR);
+    n += lockbox_wipe_dir(app, LOCKBOX_SUBGHZ_DIR);
+    n += lockbox_wipe_dir(app, LOCKBOX_IBTN_DIR);
+    n += lockbox_wipe_dir(app, LOCKBOX_INFRARED_DIR);
+    n += lockbox_wipe_dir(app, LOCKBOX_NOTES_DIR);
+    return n;
 }
 
 /* ====================================================================== *
@@ -715,6 +839,10 @@ static bool lockbox_decrypt(
             dest_dir = RFID_SRC_DIR;
         } else if(ilen >= 4 && strcmp(inner + ilen - 4, ".sub") == 0) {
             dest_dir = SUBGHZ_SRC_DIR;
+        } else if(ilen >= 5 && strcmp(inner + ilen - 5, ".ibtn") == 0) {
+            dest_dir = IBTN_SRC_DIR;
+        } else if(ilen >= 3 && strcmp(inner + ilen - 3, ".ir") == 0) {
+            dest_dir = INFRARED_SRC_DIR;
         }
         snprintf(out_dest, out_dest_sz, "%s/%s", dest_dir, inner);
 
@@ -789,6 +917,8 @@ static void lockbox_import_flow(
 
 static void vault_menu_callback(void* context, uint32_t index);
 static void item_menu_callback(void* context, uint32_t index);
+static void lockbox_start_rename(LockBoxApp* app);
+static void rename_done(void* context);
 
 /* Recovery PIN-pad megnyitasa (regi PIN bevitele). is_note dönti el, kartya
  * vagy jegyzet visszafejtesehez probaljuk. */
@@ -838,6 +968,8 @@ static void lockbox_scan_vault(LockBoxApp* app) {
     lockbox_scan_dir(app, LOCKBOX_NFC_DIR);
     lockbox_scan_dir(app, LOCKBOX_RFID_DIR);
     lockbox_scan_dir(app, LOCKBOX_SUBGHZ_DIR);
+    lockbox_scan_dir(app, LOCKBOX_IBTN_DIR);
+    lockbox_scan_dir(app, LOCKBOX_INFRARED_DIR);
 }
 
 /* A megjelenitett nev: '/'-utani resz, a ".lbx" levagva. */
@@ -880,6 +1012,7 @@ static void lockbox_build_item_menu(LockBoxApp* app) {
         submenu_add_item(
             app->item_menu, "Try old PIN", ItemActionOldPin, item_menu_callback, app);
     }
+    submenu_add_item(app->item_menu, "Rename", ItemActionRename, item_menu_callback, app);
     submenu_add_item(
         app->item_menu, "Delete from vault", ItemActionDelete, item_menu_callback, app);
 }
@@ -899,6 +1032,11 @@ static void item_menu_callback(void* context, uint32_t index) {
     if(index == ItemActionOldPin) {
         /* Regi PIN-nel probaljuk visszafejteni ezt a kartyat. */
         lockbox_start_recover(app, false);
+        return;
+    }
+
+    if(index == ItemActionRename) {
+        lockbox_start_rename(app);
         return;
     }
 
@@ -1158,6 +1296,83 @@ static void note_item_menu_callback(void* context, uint32_t index) {
 }
 
 /* ====================================================================== *
+ *                    Szef-tetel atnevezese                               *
+ * ====================================================================== */
+
+/* A szerkesztheto nev elokeszitese: levagjuk a ".lbx"-et es a tipus-vegzodest
+ * (.nfc/.rfid/.sub/.ibtn/.ir), hogy a felhasznalo csak a "cimet" szerkessze; a
+ * tipus-suffixet mentve, hogy visszafejteskor a helyere keruljon a fajl. */
+static void lockbox_start_rename(LockBoxApp* app) {
+    const char* path = app->vault_paths[app->selected_index];
+    char disp[LOCKBOX_NOTE_TITLE_LEN];
+    lockbox_display_name(path, disp, sizeof(disp)); /* pl. "mycard.nfc" */
+
+    app->rename_suffix[0] = '\0';
+    static const char* const sufs[] = {".rfid", ".ibtn", ".nfc", ".sub", ".ir"};
+    size_t dl = strlen(disp);
+    for(unsigned i = 0; i < 5; i++) {
+        size_t sl = strlen(sufs[i]);
+        if(dl > sl && strcmp(disp + dl - sl, sufs[i]) == 0) {
+            snprintf(app->rename_suffix, sizeof(app->rename_suffix), "%s", sufs[i]);
+            disp[dl - sl] = '\0';
+            break;
+        }
+    }
+    snprintf(app->rename_buf, sizeof(app->rename_buf), "%s", disp);
+
+    text_input_reset(app->rename_input);
+    text_input_set_header_text(app->rename_input, "New name");
+    text_input_set_result_callback(
+        app->rename_input, rename_done, app, app->rename_buf, sizeof(app->rename_buf), false);
+    view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdRenameInput);
+}
+
+static void rename_done(void* context) {
+    LockBoxApp* app = context;
+    const char* oldpath = app->vault_paths[app->selected_index];
+
+    /* A mappa resz (az utolso '/' elotti). */
+    char dir[LOCKBOX_PATH_LEN];
+    const char* slash = strrchr(oldpath, '/');
+    size_t dirlen = slash ? (size_t)(slash - oldpath) : 0;
+    if(dirlen >= sizeof(dir)) dirlen = sizeof(dir) - 1;
+    memcpy(dir, oldpath, dirlen);
+    dir[dirlen] = '\0';
+
+    char safe[LOCKBOX_NOTE_TITLE_LEN];
+    lockbox_note_sanitize(app->rename_buf, safe, sizeof(safe));
+    if(strlen(safe) == 0) snprintf(safe, sizeof(safe), "renamed");
+
+    char newpath[LOCKBOX_PATH_LEN + 64];
+    snprintf(newpath, sizeof(newpath), "%s/%s%s.lbx", dir, safe, app->rename_suffix);
+
+    bool ok;
+    if(strcmp(newpath, oldpath) == 0) {
+        ok = true; /* nincs valtozas */
+    } else {
+        ok = (storage_common_rename(app->storage, oldpath, newpath) == FSE_OK);
+    }
+
+    snprintf(
+        app->result_buffer,
+        sizeof(app->result_buffer),
+        "Rename %s\n"
+        "----------------\n"
+        "New name:\n%s%s\n\n"
+        "%s",
+        ok ? "OK" : "FAILED",
+        safe,
+        app->rename_suffix,
+        ok ? "The encrypted file was\nrenamed in the vault." :
+             "Could not rename (name in\nuse or write error).");
+    notification_message(app->notifications, ok ? &sequence_success : &sequence_error);
+
+    lockbox_build_vault_menu(app);
+    text_box_set_text(app->result_box, app->result_buffer);
+    view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdResult);
+}
+
+/* ====================================================================== *
  *                            PIN nezet                                   *
  * ====================================================================== */
 
@@ -1200,9 +1415,37 @@ static void draw_pin_symbol(Canvas* canvas, int cx, int cy, uint8_t sym) {
     }
 }
 
+/* Egy kis uszkalo delfin (Flipper-hangulat). x,y = a test kozeppontja; jobbra
+ * nez, ~20px szeles, ~10px magas. frame alapjan bukdacsol es csapkod a farka. */
+static void draw_dolphin(Canvas* c, int x, int y, uint32_t frame) {
+    int bobtab[4] = {0, -1, 0, 1};
+    y += bobtab[(frame >> 1) & 3];
+    int tail = (frame & 2) ? 1 : -1;
+
+    /* Hat (farok -> orr), felfele ivelve. */
+    canvas_draw_line(c, x - 8, y + 2, x - 3, y - 2);
+    canvas_draw_line(c, x - 3, y - 2, x + 3, y - 3);
+    canvas_draw_line(c, x + 3, y - 3, x + 9, y + 1);
+    /* Has (orr -> farok). */
+    canvas_draw_line(c, x + 9, y + 1, x + 4, y + 3);
+    canvas_draw_line(c, x + 4, y + 3, x - 2, y + 3);
+    canvas_draw_line(c, x - 2, y + 3, x - 8, y + 2);
+    /* Hatuszony. */
+    canvas_draw_line(c, x, y - 3, x + 2, y - 6);
+    canvas_draw_line(c, x + 2, y - 6, x + 4, y - 3);
+    /* Farokuszony (csapkod). */
+    canvas_draw_line(c, x - 8, y + 2, x - 11, y + tail);
+    canvas_draw_line(c, x - 8, y + 2, x - 11, y + 3 + tail);
+    /* Szem. */
+    canvas_draw_dot(c, x + 6, y);
+}
+
 static void pin_view_draw_callback(Canvas* canvas, void* model) {
     PinModel* m = model;
     canvas_clear(canvas);
+
+    /* Vizszintesen uszkalo delfin-pozicio (loop a kepernyon at). */
+    int dolph_x = (int)((m->anim * 2u) % 168u) - 20;
 
     /* Zarolt allapot: a brute-force vedelem miatt vissza kell szamolni. */
     if(m->locked) {
@@ -1219,6 +1462,7 @@ static void pin_view_draw_callback(Canvas* canvas, void* model) {
         canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignBottom, line);
         canvas_draw_str_aligned(
             canvas, 64, 52, AlignCenter, AlignBottom, "Too many wrong PINs");
+        draw_dolphin(canvas, dolph_x, 60, m->anim); /* a delfin orjarja a zarat */
         return;
     }
 
@@ -1232,6 +1476,9 @@ static void pin_view_draw_callback(Canvas* canvas, void* model) {
 
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str_aligned(canvas, 64, 10, AlignCenter, AlignBottom, title);
+
+    /* Uszkalo delfin a cim es a PIN-cellak kozotti savban. */
+    draw_dolphin(canvas, dolph_x, 17, m->anim);
 
     /* A bevitt sorozat: PIN_MAX kis cella, a betoltotteket nyil tolti ki. */
     const int cw = 11; /* cella szelesseg */
@@ -1296,6 +1543,14 @@ static void lockbox_lock_timer_callback(void* context) {
             m->remaining = rem;
         },
         true);
+}
+
+/* A delfin-animacio lepteto idozitoje (~120ms). A PIN- es a recovery-nezet
+ * keptszamlalojat is novel, igy mindket helyen uszik a delfin. */
+static void lockbox_anim_timer_callback(void* context) {
+    LockBoxApp* app = context;
+    with_view_model(app->pin_view, PinModel * m, { m->anim++; }, true);
+    with_view_model(app->recover_view, PinModel * m, { m->anim++; }, true);
 }
 
 /* A fomenu fejlecenek frissitese az elo kartyaszammal. Barmely muvelet utan
@@ -1447,14 +1702,35 @@ static bool pin_view_input_callback(InputEvent* event, void* context) {
         }
     } else { /* PinModeVerify */
         if(lockbox_pin_check(app, &entered)) {
-            app->fail_count = 0;
-            app->lock_until = 0;
-            lockbox_lock_save(app);
+            /* Sikeres belepes -> a brute-force letra TELJESEN nullazodik, igy
+             * egy kesobbi rossz PIN megint elolrol kezdi a zarolas-idozitest. */
+            lockbox_lock_reset(app);
             app->session_pin = entered;
             notification_message(app->notifications, &sequence_success);
             lockbox_show_menu(app);
         } else {
             app->fail_count++;
+
+            /* Panic-wipe: ha be van kapcsolva es elertuk a kuszobot, csendben
+             * toroljuk a szefet. (Nem jelezzuk kulon -> letagadhato.) A letra
+             * nullazodik, hogy a tamado ne lasson gyanus viselkedest. */
+            if(app->panic_enabled && app->fail_count >= app->panic_threshold) {
+                lockbox_panic_wipe(app);
+                lockbox_lock_reset(app);
+                with_view_model(
+                    app->pin_view,
+                    PinModel * m,
+                    {
+                        m->error = true;
+                        m->locked = false;
+                        m->remaining = 0;
+                        pin_view_reset_entry(m);
+                    },
+                    true);
+                notification_message(app->notifications, &sequence_error);
+                return true;
+            }
+
             uint32_t secs = lockbox_lock_seconds(app->fail_count);
             if(secs > 0) {
                 app->lock_until = lockbox_now() + secs;
@@ -1598,7 +1874,7 @@ static bool recover_pin_input_callback(InputEvent* event, void* context) {
 }
 
 /* ====================================================================== *
- *            PIN-valtas: minden elem ujratitkositasa uj kulccsal         *
+ *                 *bullshit ass  
  * ====================================================================== */
 
 /* Egy fajl ujrakulcsolasa: visszafejtes a REGI PIN-nel, ujratitkositas az UJ
@@ -1676,6 +1952,47 @@ static void lockbox_show_rekey(LockBoxApp* app) {
 }
 
 /* ====================================================================== *
+ *                    Settings — panic-wipe beallitasok                   *
+ * ====================================================================== */
+
+static void settings_menu_callback(void* context, uint32_t index);
+
+static void lockbox_build_settings_menu(LockBoxApp* app) {
+    submenu_reset(app->settings_menu);
+    submenu_set_header(app->settings_menu, "Panic Wipe");
+    char l1[40], l2[40], l3[40];
+    snprintf(l1, sizeof(l1), "Panic wipe: %s", app->panic_enabled ? "ON" : "OFF");
+    snprintf(l2, sizeof(l2), "Wipe after  -   (%u)", (unsigned)app->panic_threshold);
+    snprintf(l3, sizeof(l3), "Wipe after  +   (%u)", (unsigned)app->panic_threshold);
+    submenu_add_item(app->settings_menu, l1, SettingsPanicToggle, settings_menu_callback, app);
+    submenu_add_item(app->settings_menu, l2, SettingsPanicLess, settings_menu_callback, app);
+    submenu_add_item(app->settings_menu, l3, SettingsPanicMore, settings_menu_callback, app);
+    submenu_add_item(app->settings_menu, "Back", SettingsBack, settings_menu_callback, app);
+}
+
+static void settings_menu_callback(void* context, uint32_t index) {
+    LockBoxApp* app = context;
+    switch(index) {
+    case SettingsPanicToggle:
+        app->panic_enabled = !app->panic_enabled;
+        break;
+    case SettingsPanicLess:
+        if(app->panic_threshold > PANIC_WIPE_MIN) app->panic_threshold--;
+        break;
+    case SettingsPanicMore:
+        if(app->panic_threshold < PANIC_WIPE_MAX) app->panic_threshold++;
+        break;
+    case SettingsBack:
+    default:
+        lockbox_show_menu(app);
+        return;
+    }
+    lockbox_cfg_save(app);
+    lockbox_build_settings_menu(app);
+    submenu_set_selected_item(app->settings_menu, index);
+}
+
+/* ====================================================================== *
  *                            Fomenu                                      *
  * ====================================================================== */
 
@@ -1691,6 +2008,12 @@ static void menu_callback(void* context, uint32_t index) {
     case MenuIndexSubghz:
         lockbox_import_flow(app, SUBGHZ_SRC_DIR, ".sub", LOCKBOX_SUBGHZ_DIR, "SubGHz");
         break;
+    case MenuIndexIbtn:
+        lockbox_import_flow(app, IBTN_SRC_DIR, ".ibtn", LOCKBOX_IBTN_DIR, "iButton");
+        break;
+    case MenuIndexInfrared:
+        lockbox_import_flow(app, INFRARED_SRC_DIR, ".ir", LOCKBOX_INFRARED_DIR, "Infrared");
+        break;
     case MenuIndexVault:
         lockbox_build_vault_menu(app);
         view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdVault);
@@ -1698,6 +2021,10 @@ static void menu_callback(void* context, uint32_t index) {
     case MenuIndexNotes:
         lockbox_build_notes_menu(app);
         view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdNotes);
+        break;
+    case MenuIndexSettings:
+        lockbox_build_settings_menu(app);
+        view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdSettings);
         break;
     case MenuIndexChangePin:
         /* Jeloljuk, hogy PIN-valtas folyik, es elmentjuk a mostani (regi) PIN-t
@@ -1781,6 +2108,7 @@ static LockBoxApp* lockbox_app_alloc(void) {
     /* Brute-force zarolas-visszaszamlalo timer (2x masodpercenkent). */
     app->lock_timer =
         furi_timer_alloc(lockbox_lock_timer_callback, FuriTimerTypePeriodic, app);
+    app->anim_timer = furi_timer_alloc(lockbox_anim_timer_callback, FuriTimerTypePeriodic, app);
 
     /* PIN nezet */
     app->pin_view = view_alloc();
@@ -1805,8 +2133,11 @@ static LockBoxApp* lockbox_app_alloc(void) {
     submenu_add_item(app->menu, "Encrypt NFC Card", MenuIndexNfc, menu_callback, app);
     submenu_add_item(app->menu, "Encrypt RFID Tag", MenuIndexRfid, menu_callback, app);
     submenu_add_item(app->menu, "Encrypt SubGHz", MenuIndexSubghz, menu_callback, app);
+    submenu_add_item(app->menu, "Encrypt iButton", MenuIndexIbtn, menu_callback, app);
+    submenu_add_item(app->menu, "Encrypt Infrared", MenuIndexInfrared, menu_callback, app);
     submenu_add_item(app->menu, "My Vault", MenuIndexVault, menu_callback, app);
     submenu_add_item(app->menu, "Secure Notes", MenuIndexNotes, menu_callback, app);
+    submenu_add_item(app->menu, "Settings", MenuIndexSettings, menu_callback, app);
     submenu_add_item(app->menu, "Change PIN", MenuIndexChangePin, menu_callback, app);
     submenu_add_item(app->menu, "About", MenuIndexAbout, menu_callback, app);
     view_dispatcher_add_view(app->view_dispatcher, ViewIdMenu, submenu_get_view(app->menu));
@@ -1854,6 +2185,18 @@ static LockBoxApp* lockbox_app_alloc(void) {
     view_dispatcher_add_view(
         app->view_dispatcher, ViewIdNoteInput, text_input_get_view(app->note_input));
 
+    /* Atnevezes bevitel (a szef-tetel muvelet-menujebol) */
+    app->rename_input = text_input_alloc();
+    view_set_previous_callback(text_input_get_view(app->rename_input), view_to_vault);
+    view_dispatcher_add_view(
+        app->view_dispatcher, ViewIdRenameInput, text_input_get_view(app->rename_input));
+
+    /* Settings (panic-wipe) */
+    app->settings_menu = submenu_alloc();
+    view_set_previous_callback(submenu_get_view(app->settings_menu), view_to_menu);
+    view_dispatcher_add_view(
+        app->view_dispatcher, ViewIdSettings, submenu_get_view(app->settings_menu));
+
     /* About */
     app->about_box = text_box_alloc();
     snprintf(
@@ -1861,25 +2204,28 @@ static LockBoxApp* lockbox_app_alloc(void) {
         sizeof(app->about_buffer),
         "LockBox %s\n"
         "----------------\n"
-        "Device-bound vault for\n"
-        "NFC, RFID and SubGHz.\n\n"
-        "The encryption key comes\n"
-        "from THIS Flipper's serial\n"
+        "Device-bound vault for NFC,\n"
+        "RFID, SubGHz, iButton & IR,\n"
+        "plus Secure Notes.\n\n"
+        "Key = THIS Flipper's serial\n"
         "+ your PIN (SHA-256 KDF).\n"
-        "It is never stored.\n\n"
-        "A copied .lbx file cannot\n"
-        "be decrypted on another\n"
+        "Never stored. A copied .lbx\n"
+        "won't open on another\n"
         "Flipper or without the PIN.\n\n"
-        "Encrypt: pick a card; it is\n"
-        "encrypted into the vault\n"
-        "and removed from its app.\n\n"
-        "My Vault: list stored cards,\n"
-        "decrypt (restore) or delete.\n\n"
+        "Encrypt: pick a file; it is\n"
+        "locked into the vault and\n"
+        "removed from its app.\n\n"
+        "My Vault: decrypt, rename\n"
+        "or delete stored items.\n\n"
         "Secure Notes: store text or\n"
-        "passwords, encrypted the\n"
-        "same way. View or delete.\n\n"
-        "Decrypt your cards and notes\n"
-        "BEFORE changing the PIN.\n\n"
+        "passwords, encrypted too.\n\n"
+        "Settings - Panic Wipe erases\n"
+        "the vault after N wrong PINs\n"
+        "(OFF by default).\n\n"
+        "Wrong PIN locks you out,\n"
+        "longer each time.\n\n"
+        "Decrypt items BEFORE\n"
+        "changing the PIN.\n\n"
         "Author: LeviXX\n",
         APP_VERSION);
     text_box_set_text(app->about_box, app->about_buffer);
@@ -1915,6 +2261,8 @@ static void lockbox_app_free(LockBoxApp* app) {
     view_dispatcher_remove_view(app->view_dispatcher, ViewIdNoteView);
     view_dispatcher_remove_view(app->view_dispatcher, ViewIdTitleInput);
     view_dispatcher_remove_view(app->view_dispatcher, ViewIdNoteInput);
+    view_dispatcher_remove_view(app->view_dispatcher, ViewIdRenameInput);
+    view_dispatcher_remove_view(app->view_dispatcher, ViewIdSettings);
     view_dispatcher_remove_view(app->view_dispatcher, ViewIdAbout);
     view_dispatcher_remove_view(app->view_dispatcher, ViewIdResult);
 
@@ -1926,14 +2274,18 @@ static void lockbox_app_free(LockBoxApp* app) {
     submenu_free(app->rekey_menu);
     submenu_free(app->notes_menu);
     submenu_free(app->note_item_menu);
+    submenu_free(app->settings_menu);
     text_box_free(app->about_box);
     text_box_free(app->result_box);
     text_box_free(app->note_view);
     text_input_free(app->title_input);
     text_input_free(app->note_input);
+    text_input_free(app->rename_input);
 
     furi_timer_stop(app->lock_timer);
     furi_timer_free(app->lock_timer);
+    furi_timer_stop(app->anim_timer);
+    furi_timer_free(app->anim_timer);
 
     view_dispatcher_free(app->view_dispatcher);
 
@@ -1950,9 +2302,15 @@ int32_t lockbox_app(void* p) {
     LockBoxApp* app = lockbox_app_alloc();
 
     app->pin_is_set = lockbox_pin_exists(app);
+    lockbox_cfg_load(app); /* panic-wipe beallitasok */
     lockbox_lock_load(app); /* egy korabbi zarolas tulelje az ujrainditast */
 
     uint32_t now = lockbox_now();
+    /* Ha egy korabbi zarolas mar teljesen lejart, a letra nullazodik -> a
+     * kovetkezo rossz PIN megint elolrol kezdi a zarolas-idozitest. */
+    if(app->lock_until != 0 && now >= app->lock_until) {
+        lockbox_lock_reset(app);
+    }
     uint32_t rem = (app->lock_until > now) ? (app->lock_until - now) : 0;
     with_view_model(
         app->pin_view,
@@ -1967,6 +2325,8 @@ int32_t lockbox_app(void* p) {
 
     /* A visszaszamlalo-timer inditasa (frissiti a zarolas allapotat). */
     furi_timer_start(app->lock_timer, furi_ms_to_ticks(500));
+    /* A delfin-animacio idozitoje (~120ms). */
+    furi_timer_start(app->anim_timer, furi_ms_to_ticks(120));
 
     view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdPin);
     view_dispatcher_run(app->view_dispatcher);

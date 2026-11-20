@@ -10,6 +10,6 @@ App(
     fap_icon="lockbox_icon.png",
     fap_icon_assets="images",
     fap_author="LeviXX",
-    fap_version="2.0",
-    fap_description="PIN-protected, device-bound vault that encrypts your saved NFC, RFID and SubGHz files.",
+    fap_version="2.1",
+    fap_description="PIN-protected, device-bound vault that encrypts NFC, RFID, SubGHz, iButton and Infrared files, with panic-wipe.",
 )
