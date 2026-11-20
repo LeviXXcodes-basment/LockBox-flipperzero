@@ -14,7 +14,7 @@ useless on any other device.
 - **My Vault** — list stored items, decrypt (restore) them back to their app, **rename**,
   or delete.
 - **Secure Notes** — store text/passwords, encrypted the same way.
-- **Direction-button PIN** — Up/Down/Left/Right/Back sequence, like the Momentum lock code.
+- **Direction-button PIN** — a 4–6 long Up/Down/Left/Right/Back sequence, like the Momentum lock code.
 - **Brute-force lockout** — escalating timeout after wrong PINs (30s → 60s → 120s →
   5 min → 10 min), persisted across restarts; the ladder resets after a correct PIN.
 - **Panic Wipe** (opt-in, Settings) — after a configurable number of wrong PINs, the

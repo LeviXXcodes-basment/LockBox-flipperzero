@@ -28,7 +28,7 @@
 #include <dialogs/dialogs.h>
 #include <notification/notification_messages.h>
 
-#define APP_VERSION "v2.1"
+#define APP_VERSION "v2.2"
 
 #define LOCKBOX_DIR      "/ext/apps_data/lockbox"
 #define LOCKBOX_PIN_PATH  "/ext/apps_data/lockbox/pin.dat"
@@ -54,7 +54,7 @@
 #define INFRARED_SRC_DIR   "/ext/infrared"
 /* A PIN mostantol IRANYGOMB-sorozat (Fel/Le/Balra/Jobbra/Vissza), mint a
  * Momentum zarkod. PIN_MAX a max hossz, PIN_MIN a minimum. */
-#define PIN_MAX            10
+#define PIN_MAX            6
 #define PIN_MIN            4
 #define LOCKBOX_MAX_FILE (32768) /* max importalhato fajlmeret (bajt) */
 #define LOCKBOX_MAGIC    "LBX1" /* 4 bajtos fejlec a helyes-kulcs ellenorzeshez */
@@ -269,7 +269,6 @@ typedef struct {
     bool error;
     bool locked; /* epp zarolva van-e (brute-force vedelem) */
     uint32_t remaining; /* hatralevo masodpercek a zarolasbol */
-    uint32_t anim; /* animacios keptszamlalo (uszkalo delfin) */
 } PinModel;
 
 typedef struct {
@@ -294,7 +293,6 @@ typedef struct {
     Submenu* settings_menu; /* panic-wipe beallitasok */
 
     FuriTimer* lock_timer; /* a zarolas-visszaszamlalo frissitese */
-    FuriTimer* anim_timer; /* a delfin-animacio frissitese (~100ms) */
 
     char about_buffer[768];
     char result_buffer[512];
@@ -1382,70 +1380,42 @@ static void pin_view_reset_entry(PinModel* m) {
 
 /* Egy iranygomb-szimbolum kirajzolasa egy w x h cellaba, kozepre. */
 static void draw_pin_symbol(Canvas* canvas, int cx, int cy, uint8_t sym) {
-    /* cx,cy = a cella kozeppontja; ~7px meretu nyil. */
+    /* cx,cy = a cella kozeppontja; ~11px meretu nyil (nagyobb cellakhoz). */
     switch(sym) {
     case PinSymUp:
-        canvas_draw_line(canvas, cx, cy - 3, cx, cy + 3);
-        canvas_draw_line(canvas, cx, cy - 3, cx - 2, cy - 1);
-        canvas_draw_line(canvas, cx, cy - 3, cx + 2, cy - 1);
+        canvas_draw_line(canvas, cx, cy - 5, cx, cy + 5);
+        canvas_draw_line(canvas, cx, cy - 5, cx - 3, cy - 2);
+        canvas_draw_line(canvas, cx, cy - 5, cx + 3, cy - 2);
         break;
     case PinSymDown:
-        canvas_draw_line(canvas, cx, cy - 3, cx, cy + 3);
-        canvas_draw_line(canvas, cx, cy + 3, cx - 2, cy + 1);
-        canvas_draw_line(canvas, cx, cy + 3, cx + 2, cy + 1);
+        canvas_draw_line(canvas, cx, cy - 5, cx, cy + 5);
+        canvas_draw_line(canvas, cx, cy + 5, cx - 3, cy + 2);
+        canvas_draw_line(canvas, cx, cy + 5, cx + 3, cy + 2);
         break;
     case PinSymLeft:
-        canvas_draw_line(canvas, cx - 3, cy, cx + 3, cy);
-        canvas_draw_line(canvas, cx - 3, cy, cx - 1, cy - 2);
-        canvas_draw_line(canvas, cx - 3, cy, cx - 1, cy + 2);
+        canvas_draw_line(canvas, cx - 5, cy, cx + 5, cy);
+        canvas_draw_line(canvas, cx - 5, cy, cx - 2, cy - 3);
+        canvas_draw_line(canvas, cx - 5, cy, cx - 2, cy + 3);
         break;
     case PinSymRight:
-        canvas_draw_line(canvas, cx - 3, cy, cx + 3, cy);
-        canvas_draw_line(canvas, cx + 3, cy, cx + 1, cy - 2);
-        canvas_draw_line(canvas, cx + 3, cy, cx + 1, cy + 2);
+        canvas_draw_line(canvas, cx - 5, cy, cx + 5, cy);
+        canvas_draw_line(canvas, cx + 5, cy, cx + 2, cy - 3);
+        canvas_draw_line(canvas, cx + 5, cy, cx + 2, cy + 3);
         break;
     case PinSymBack:
     default:
-        /* Vissza: egy kis "U" nyil balra. */
-        canvas_draw_line(canvas, cx - 3, cy, cx + 2, cy);
-        canvas_draw_line(canvas, cx + 2, cy, cx + 2, cy + 3);
-        canvas_draw_line(canvas, cx - 3, cy, cx - 1, cy - 2);
-        canvas_draw_line(canvas, cx - 3, cy, cx - 1, cy + 2);
+        /* Vissza: egy "U" nyil balra. */
+        canvas_draw_line(canvas, cx - 4, cy - 1, cx + 3, cy - 1);
+        canvas_draw_line(canvas, cx + 3, cy - 1, cx + 3, cy + 4);
+        canvas_draw_line(canvas, cx - 4, cy - 1, cx - 1, cy - 4);
+        canvas_draw_line(canvas, cx - 4, cy - 1, cx - 1, cy + 2);
         break;
     }
-}
-
-/* Egy kis uszkalo delfin (Flipper-hangulat). x,y = a test kozeppontja; jobbra
- * nez, ~20px szeles, ~10px magas. frame alapjan bukdacsol es csapkod a farka. */
-static void draw_dolphin(Canvas* c, int x, int y, uint32_t frame) {
-    int bobtab[4] = {0, -1, 0, 1};
-    y += bobtab[(frame >> 1) & 3];
-    int tail = (frame & 2) ? 1 : -1;
-
-    /* Hat (farok -> orr), felfele ivelve. */
-    canvas_draw_line(c, x - 8, y + 2, x - 3, y - 2);
-    canvas_draw_line(c, x - 3, y - 2, x + 3, y - 3);
-    canvas_draw_line(c, x + 3, y - 3, x + 9, y + 1);
-    /* Has (orr -> farok). */
-    canvas_draw_line(c, x + 9, y + 1, x + 4, y + 3);
-    canvas_draw_line(c, x + 4, y + 3, x - 2, y + 3);
-    canvas_draw_line(c, x - 2, y + 3, x - 8, y + 2);
-    /* Hatuszony. */
-    canvas_draw_line(c, x, y - 3, x + 2, y - 6);
-    canvas_draw_line(c, x + 2, y - 6, x + 4, y - 3);
-    /* Farokuszony (csapkod). */
-    canvas_draw_line(c, x - 8, y + 2, x - 11, y + tail);
-    canvas_draw_line(c, x - 8, y + 2, x - 11, y + 3 + tail);
-    /* Szem. */
-    canvas_draw_dot(c, x + 6, y);
 }
 
 static void pin_view_draw_callback(Canvas* canvas, void* model) {
     PinModel* m = model;
     canvas_clear(canvas);
-
-    /* Vizszintesen uszkalo delfin-pozicio (loop a kepernyon at). */
-    int dolph_x = (int)((m->anim * 2u) % 168u) - 20;
 
     /* Zarolt allapot: a brute-force vedelem miatt vissza kell szamolni. */
     if(m->locked) {
@@ -1462,7 +1432,6 @@ static void pin_view_draw_callback(Canvas* canvas, void* model) {
         canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignBottom, line);
         canvas_draw_str_aligned(
             canvas, 64, 52, AlignCenter, AlignBottom, "Too many wrong PINs");
-        draw_dolphin(canvas, dolph_x, 60, m->anim); /* a delfin orjarja a zarat */
         return;
     }
 
@@ -1477,16 +1446,14 @@ static void pin_view_draw_callback(Canvas* canvas, void* model) {
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str_aligned(canvas, 64, 10, AlignCenter, AlignBottom, title);
 
-    /* Uszkalo delfin a cim es a PIN-cellak kozotti savban. */
-    draw_dolphin(canvas, dolph_x, 17, m->anim);
-
-    /* A bevitt sorozat: PIN_MAX kis cella, a betoltotteket nyil tolti ki. */
-    const int cw = 11; /* cella szelesseg */
-    const int ch = 15; /* cella magassag */
-    const int gap = 1;
+    /* A bevitt sorozat: PIN_MAX cella, a betoltotteket nyil tolti ki.
+     * 6 cella -> bov a hely, nagyobb kockak. */
+    const int cw = 16; /* cella szelesseg */
+    const int ch = 20; /* cella magassag */
+    const int gap = 3;
     int total = PIN_MAX * cw + (PIN_MAX - 1) * gap;
     int x0 = (128 - total) / 2;
-    int y0 = 23;
+    int y0 = 20;
     for(uint8_t i = 0; i < PIN_MAX; i++) {
         int x = x0 + i * (cw + gap);
         bool filled = i < m->cur.len;
@@ -1543,14 +1510,6 @@ static void lockbox_lock_timer_callback(void* context) {
             m->remaining = rem;
         },
         true);
-}
-
-/* A delfin-animacio lepteto idozitoje (~120ms). A PIN- es a recovery-nezet
- * keptszamlalojat is novel, igy mindket helyen uszik a delfin. */
-static void lockbox_anim_timer_callback(void* context) {
-    LockBoxApp* app = context;
-    with_view_model(app->pin_view, PinModel * m, { m->anim++; }, true);
-    with_view_model(app->recover_view, PinModel * m, { m->anim++; }, true);
 }
 
 /* A fomenu fejlecenek frissitese az elo kartyaszammal. Barmely muvelet utan
@@ -2108,7 +2067,6 @@ static LockBoxApp* lockbox_app_alloc(void) {
     /* Brute-force zarolas-visszaszamlalo timer (2x masodpercenkent). */
     app->lock_timer =
         furi_timer_alloc(lockbox_lock_timer_callback, FuriTimerTypePeriodic, app);
-    app->anim_timer = furi_timer_alloc(lockbox_anim_timer_callback, FuriTimerTypePeriodic, app);
 
     /* PIN nezet */
     app->pin_view = view_alloc();
@@ -2284,8 +2242,6 @@ static void lockbox_app_free(LockBoxApp* app) {
 
     furi_timer_stop(app->lock_timer);
     furi_timer_free(app->lock_timer);
-    furi_timer_stop(app->anim_timer);
-    furi_timer_free(app->anim_timer);
 
     view_dispatcher_free(app->view_dispatcher);
 
@@ -2325,8 +2281,6 @@ int32_t lockbox_app(void* p) {
 
     /* A visszaszamlalo-timer inditasa (frissiti a zarolas allapotat). */
     furi_timer_start(app->lock_timer, furi_ms_to_ticks(500));
-    /* A delfin-animacio idozitoje (~120ms). */
-    furi_timer_start(app->anim_timer, furi_ms_to_ticks(120));
 
     view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdPin);
     view_dispatcher_run(app->view_dispatcher);
