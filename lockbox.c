@@ -28,7 +28,7 @@
 #include <dialogs/dialogs.h>
 #include <notification/notification_messages.h>
 
-#define APP_VERSION "v2.2"
+#define APP_VERSION "v2.3"
 
 #define LOCKBOX_DIR      "/ext/apps_data/lockbox"
 #define LOCKBOX_PIN_PATH  "/ext/apps_data/lockbox/pin.dat"
@@ -58,6 +58,7 @@
 #define PIN_MIN            4
 #define LOCKBOX_MAX_FILE (32768) /* max importalhato fajlmeret (bajt) */
 #define LOCKBOX_MAGIC    "LBX1" /* 4 bajtos fejlec a helyes-kulcs ellenorzeshez */
+#define LOCKBOX_MAGIC2   "LBX2" /* regi "opak" formatum: a nev a fajlon belul (helyreallitashoz) */
 #define LOCKBOX_MAGIC_LEN 4
 #define LOCKBOX_SALT_LEN  16 /* fajlonkenti veletlen so */
 #define LOCKBOX_KDF_ROUNDS 8000 /* lassu kulcs-szarmaztatas (brute-force lassitas) */
@@ -183,11 +184,6 @@ typedef enum {
     ViewIdMenu,
     ViewIdVault,
     ViewIdItem,
-    ViewIdNotes,
-    ViewIdNoteItem,
-    ViewIdNoteView,
-    ViewIdTitleInput,
-    ViewIdNoteInput,
     ViewIdRecoverPin,
     ViewIdRekey,
     ViewIdSettings,
@@ -211,10 +207,10 @@ typedef enum {
     MenuIndexSubghz,
     MenuIndexIbtn,
     MenuIndexInfrared,
+    MenuIndexEncryptAll,
+    MenuIndexDecryptAll,
     MenuIndexVault,
-    MenuIndexNotes,
     MenuIndexSettings,
-    MenuIndexChangePin,
     MenuIndexAbout,
 } MenuIndex;
 
@@ -231,15 +227,9 @@ typedef enum {
     SettingsPanicToggle,
     SettingsPanicLess,
     SettingsPanicMore,
+    SettingsChangePin,
     SettingsBack,
 } SettingsAction;
-
-/* ---- Jegyzet-muvelet almenu ---- */
-typedef enum {
-    NoteActionView,
-    NoteActionOldPin,
-    NoteActionDelete,
-} NoteAction;
 
 /* ---- PIN-valtas utani ujratitkositas almenu ---- */
 typedef enum {
@@ -282,13 +272,8 @@ typedef struct {
     Submenu* menu;
     Submenu* vault_menu;
     Submenu* item_menu;
-    Submenu* notes_menu;
-    Submenu* note_item_menu;
     TextBox* about_box;
     TextBox* result_box;
-    TextBox* note_view;
-    TextInput* title_input;
-    TextInput* note_input;
     TextInput* rename_input; /* szef-tetel atnevezese */
     Submenu* settings_menu; /* panic-wipe beallitasok */
 
@@ -299,6 +284,10 @@ typedef struct {
     char menu_header[32];
     bool pin_is_set;
     PinVal session_pin; /* a belepeskor megadott PIN (a kulcshoz, csak RAM) */
+
+    /* Mester-kulcs gyorsitotar (a regi "opak" kartyak helyreallitasahoz / gyors olvasashoz). */
+    uint8_t session_master[32];
+    bool session_master_valid;
 
     /* Brute-force vedelem (lemezre mentve, hogy ujrainditas ne nullazza) */
     uint32_t fail_count; /* egymas utani rossz PIN-ek szama */
@@ -312,7 +301,6 @@ typedef struct {
     View* recover_view; /* kulon PIN-pad a regi PIN beviteléhez */
     PinVal recovery_pin; /* a megadott regi PIN (csak RAM) */
     bool use_recovery_pin; /* a derive_key a recovery_pin-t hasznalja-e */
-    bool recover_is_note; /* jegyzetet (true) vagy kartyat (false) allitunk vissza */
 
     /* PIN-valtas (Change PIN) + ujratitkositas az uj kulccsal */
     bool changing_pin; /* a PIN-pad epp Change PIN folyamatban van-e */
@@ -323,14 +311,6 @@ typedef struct {
     char vault_paths[LOCKBOX_MAX_ITEMS][LOCKBOX_PATH_LEN];
     uint8_t vault_count;
     uint8_t selected_index; /* a kivalasztott kartya a listaban */
-
-    /* Jegyzetek allapota */
-    char note_paths[LOCKBOX_MAX_ITEMS][LOCKBOX_PATH_LEN];
-    uint8_t note_count;
-    uint8_t note_selected;
-    char note_title[LOCKBOX_NOTE_TITLE_LEN]; /* uj jegyzet cime (bevitel) */
-    char note_text[LOCKBOX_NOTE_TEXT_LEN]; /* uj jegyzet szovege (bevitel) */
-    char note_display[LOCKBOX_NOTE_TEXT_LEN + 128]; /* megtekintett jegyzet (cim+szoveg) */
 
     /* Atnevezes allapota */
     char rename_buf[LOCKBOX_NOTE_TITLE_LEN]; /* szerkesztheto nev (tipus-suffix nelkul) */
@@ -570,6 +550,50 @@ static void lockbox_derive_key(LockBoxApp* app, const uint8_t* salt, uint8_t out
     memcpy(out_key, h, 32);
 }
 
+/* HELYREALLITAS: a regi "opak" (mester-kulcsos) kartyak olvasasahoz. A mester =
+ * lassu KDF( UID || PIN ), fajl-so NELKUL -> munkamenetenkent egyszer kell. */
+static void lockbox_derive_master(LockBoxApp* app, uint8_t out[32]) {
+    if(!app->use_recovery_pin && app->session_master_valid) {
+        memcpy(out, app->session_master, 32);
+        return;
+    }
+    const uint8_t* uid = furi_hal_version_uid();
+    size_t uid_len = furi_hal_version_uid_size();
+    const PinVal* pin = app->use_recovery_pin ? &app->recovery_pin : &app->session_pin;
+    uint8_t plen = pin->len;
+
+    Sha256 c;
+    sha256_init(&c);
+    sha256_update(&c, uid, uid_len);
+    sha256_update(&c, &plen, 1);
+    sha256_update(&c, pin->s, pin->len);
+    uint8_t h[32];
+    sha256_final(&c, h);
+    for(uint32_t i = 0; i < LOCKBOX_KDF_ROUNDS; i++) {
+        Sha256 c2;
+        sha256_init(&c2);
+        sha256_update(&c2, h, sizeof(h));
+        sha256_update(&c2, uid, uid_len);
+        sha256_final(&c2, h);
+    }
+    if(!app->use_recovery_pin) {
+        memcpy(app->session_master, h, 32);
+        app->session_master_valid = true;
+    }
+    memcpy(out, h, 32);
+}
+
+/* Mester-kulcsos per-fajl kulcs: SHA-256( mester || so ). */
+static void lockbox_derive_key_master(LockBoxApp* app, const uint8_t* salt, uint8_t out_key[32]) {
+    uint8_t master[32];
+    lockbox_derive_master(app, master);
+    Sha256 c;
+    sha256_init(&c);
+    sha256_update(&c, master, 32);
+    sha256_update(&c, salt, LOCKBOX_SALT_LEN);
+    sha256_final(&c, out_key);
+}
+
 /* SHA-256 kulcsfolyam (hash-CTR): blokk_i = SHA256(key || LE64(i)); XOR.
  * Szimmetrikus: ugyanaz titkosit es fejt vissza. */
 static void lockbox_cipher(const uint8_t key[32], uint8_t* data, size_t len) {
@@ -590,6 +614,99 @@ static void lockbox_cipher(const uint8_t key[32], uint8_t* data, size_t len) {
         off += n;
         counter++;
     }
+}
+
+/* Beolvassa a [so][rejtjel] fajlt es visszaadja a MEGFEJTETT testet (a MAGIC-kal).
+ * Eloszor a per-fajl kulccsal (jelenlegi + regi v2.4 sema), ha a MAGIC nem stimmel,
+ * a mester-kulcsos (regi v2.5 opak) semaval. Igy a REGI kartyak is helyreallithatok.
+ * A hivo ellenorzi a MAGIC-ot es szabaditja fel a *out buffert. */
+static bool lockbox_recover_body(LockBoxApp* app, const char* path, uint8_t** out, size_t* out_len) {
+    *out = NULL;
+    *out_len = 0;
+    bool ok = false;
+    uint8_t* cipher = NULL;
+    uint8_t* work = NULL;
+    File* f = storage_file_alloc(app->storage);
+    do {
+        if(!storage_file_open(f, path, FSAM_READ, FSOM_OPEN_EXISTING)) break;
+        uint64_t size = storage_file_size(f);
+        if(size <= (uint64_t)(LOCKBOX_SALT_LEN + LOCKBOX_MAGIC_LEN)) break;
+        if(size > (uint64_t)(LOCKBOX_SALT_LEN + LOCKBOX_MAGIC_LEN + 1 + 255 + LOCKBOX_MAX_FILE))
+            break;
+
+        uint8_t salt[LOCKBOX_SALT_LEN];
+        if(storage_file_read(f, salt, sizeof(salt)) != sizeof(salt)) break;
+        size_t body = (size_t)size - LOCKBOX_SALT_LEN;
+        cipher = malloc(body);
+        work = malloc(body);
+        if(!cipher || !work) break;
+        if(storage_file_read(f, cipher, body) != body) break;
+
+        uint8_t key[32];
+        /* 1) per-fajl kulcs (jelenlegi + regi v2.4). */
+        lockbox_derive_key(app, salt, key);
+        memcpy(work, cipher, body);
+        lockbox_cipher(key, work, body);
+        bool good = (memcmp(work, LOCKBOX_MAGIC, LOCKBOX_MAGIC_LEN) == 0) ||
+                    (memcmp(work, LOCKBOX_MAGIC2, LOCKBOX_MAGIC_LEN) == 0);
+        if(!good) {
+            /* 2) mester-kulcsos sema (regi v2.5 opak kartyak). */
+            lockbox_derive_key_master(app, salt, key);
+            memcpy(work, cipher, body);
+            lockbox_cipher(key, work, body);
+            good = (memcmp(work, LOCKBOX_MAGIC, LOCKBOX_MAGIC_LEN) == 0) ||
+                   (memcmp(work, LOCKBOX_MAGIC2, LOCKBOX_MAGIC_LEN) == 0);
+        }
+        if(!good) break;
+
+        *out = work;
+        work = NULL;
+        *out_len = body;
+        ok = true;
+    } while(false);
+    storage_file_close(f);
+    storage_file_free(f);
+    if(cipher) free(cipher);
+    if(work) free(work);
+    return ok;
+}
+
+/* A megfejtett testbol kiszedi a NEVET es az ADAT-mutatot. LBX2: a nev beagyazva;
+ * LBX1: a nev a fajlnevbol (a hivo adja at path-ban). */
+static bool lockbox_parse_body(
+    const char* path,
+    const uint8_t* body,
+    size_t blen,
+    char* name_out,
+    size_t name_cap,
+    const uint8_t** data_out,
+    size_t* data_len) {
+    if(blen >= (size_t)(LOCKBOX_MAGIC_LEN + 1) &&
+       memcmp(body, LOCKBOX_MAGIC2, LOCKBOX_MAGIC_LEN) == 0) {
+        size_t nlen = body[LOCKBOX_MAGIC_LEN];
+        if((size_t)(LOCKBOX_MAGIC_LEN + 1) + nlen > blen) return false;
+        if(name_out && name_cap) {
+            size_t cn = (nlen < name_cap - 1) ? nlen : name_cap - 1;
+            memcpy(name_out, body + LOCKBOX_MAGIC_LEN + 1, cn);
+            name_out[cn] = '\0';
+        }
+        *data_out = body + LOCKBOX_MAGIC_LEN + 1 + nlen;
+        *data_len = blen - LOCKBOX_MAGIC_LEN - 1 - nlen;
+        return true;
+    }
+    if(memcmp(body, LOCKBOX_MAGIC, LOCKBOX_MAGIC_LEN) == 0) {
+        if(name_out && name_cap) {
+            const char* base = strrchr(path, '/');
+            base = base ? base + 1 : path;
+            snprintf(name_out, name_cap, "%s", base);
+            size_t ll = strlen(name_out);
+            if(ll >= 4 && strcmp(name_out + ll - 4, ".lbx") == 0) name_out[ll - 4] = '\0';
+        }
+        *data_out = body + LOCKBOX_MAGIC_LEN;
+        *data_len = blen - LOCKBOX_MAGIC_LEN;
+        return true;
+    }
+    return false;
 }
 
 /* Egy memoria-buffer titkositott fajlba irasa (jegyzetekhez).
@@ -618,48 +735,6 @@ static bool lockbox_encrypt_to_file(
         if(!storage_file_open(f, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) break;
         if(storage_file_write(f, salt, sizeof(salt)) != sizeof(salt)) break;
         if(storage_file_write(f, buf, total) != total) break;
-        ok = true;
-    } while(false);
-    storage_file_close(f);
-    storage_file_free(f);
-    if(buf) free(buf);
-    return ok;
-}
-
-/* Titkositott fajl visszafejtese memoria-bufferbe (jegyzetekhez). A kimenet
- * nullal lezart C-string lesz. Rossz PIN/eszkoz -> MAGIC nem egyezik -> false. */
-static bool lockbox_decrypt_from_file(
-    LockBoxApp* app,
-    const char* path,
-    char* out,
-    size_t out_cap) {
-    bool ok = false;
-    uint8_t* buf = NULL;
-    File* f = storage_file_alloc(app->storage);
-    do {
-        if(!storage_file_open(f, path, FSAM_READ, FSOM_OPEN_EXISTING)) break;
-        uint64_t size = storage_file_size(f);
-        if(size <= (uint64_t)(LOCKBOX_SALT_LEN + LOCKBOX_MAGIC_LEN)) break;
-        if(size > (uint64_t)(LOCKBOX_SALT_LEN + LOCKBOX_MAGIC_LEN + LOCKBOX_MAX_FILE)) break;
-
-        uint8_t salt[LOCKBOX_SALT_LEN];
-        if(storage_file_read(f, salt, sizeof(salt)) != sizeof(salt)) break;
-
-        size_t body = (size_t)size - LOCKBOX_SALT_LEN;
-        buf = malloc(body);
-        if(!buf) break;
-        if(storage_file_read(f, buf, body) != body) break;
-
-        uint8_t key[32];
-        lockbox_derive_key(app, salt, key);
-        lockbox_cipher(key, buf, body);
-
-        if(memcmp(buf, LOCKBOX_MAGIC, LOCKBOX_MAGIC_LEN) != 0) break;
-
-        size_t plain = body - LOCKBOX_MAGIC_LEN;
-        if(plain > out_cap - 1) plain = out_cap - 1;
-        memcpy(out, buf + LOCKBOX_MAGIC_LEN, plain);
-        out[plain] = '\0';
         ok = true;
     } while(false);
     storage_file_close(f);
@@ -714,11 +789,11 @@ static bool
 static bool lockbox_can_decrypt(LockBoxApp* app, const char* path) {
     bool saved = app->use_recovery_pin;
     app->use_recovery_pin = false; /* a session PIN-nel probaljuk */
-    uint8_t* plain = NULL;
+    uint8_t* body = NULL;
     size_t len = 0;
-    bool ok = lockbox_decrypt_raw(app, path, &plain, &len);
+    bool ok = lockbox_recover_body(app, path, &body, &len);
     app->use_recovery_pin = saved;
-    if(plain) free(plain);
+    if(body) free(body);
     return ok;
 }
 
@@ -797,65 +872,41 @@ static bool lockbox_decrypt(
     const char* lbx_path,
     char* out_dest,
     size_t out_dest_sz) {
+    /* Helyreallito olvasas: a regi "opak" (LBX2 / mester-kulcsos) kartyak is. */
+    uint8_t* body = NULL;
+    size_t blen = 0;
+    if(!lockbox_recover_body(app, lbx_path, &body, &blen)) return false;
+
+    char inner[208];
+    const uint8_t* data = NULL;
+    size_t dlen = 0;
+    if(!lockbox_parse_body(lbx_path, body, blen, inner, sizeof(inner), &data, &dlen)) {
+        free(body);
+        return false;
+    }
+
+    /* A cel-mappa a NEV vegzodese alapjan. */
+    const char* dest_dir = NFC_SRC_DIR;
+    size_t ilen = strlen(inner);
+    if(ilen >= 5 && strcmp(inner + ilen - 5, ".rfid") == 0) {
+        dest_dir = RFID_SRC_DIR;
+    } else if(ilen >= 4 && strcmp(inner + ilen - 4, ".sub") == 0) {
+        dest_dir = SUBGHZ_SRC_DIR;
+    } else if(ilen >= 5 && strcmp(inner + ilen - 5, ".ibtn") == 0) {
+        dest_dir = IBTN_SRC_DIR;
+    } else if(ilen >= 3 && strcmp(inner + ilen - 3, ".ir") == 0) {
+        dest_dir = INFRARED_SRC_DIR;
+    }
+    snprintf(out_dest, out_dest_sz, "%s/%s", dest_dir, inner);
+
     bool ok = false;
-    uint8_t* buf = NULL;
-    File* src = storage_file_alloc(app->storage);
     File* dst = storage_file_alloc(app->storage);
-
-    do {
-        if(!storage_file_open(src, lbx_path, FSAM_READ, FSOM_OPEN_EXISTING)) break;
-        uint64_t size = storage_file_size(src);
-        if(size <= (uint64_t)(LOCKBOX_SALT_LEN + LOCKBOX_MAGIC_LEN)) break;
-        if(size > (uint64_t)(LOCKBOX_SALT_LEN + LOCKBOX_MAGIC_LEN + LOCKBOX_MAX_FILE)) break;
-
-        uint8_t salt[LOCKBOX_SALT_LEN];
-        if(storage_file_read(src, salt, sizeof(salt)) != sizeof(salt)) break;
-
-        size_t body = (size_t)size - LOCKBOX_SALT_LEN;
-        buf = malloc(body);
-        if(!buf) break;
-        if(storage_file_read(src, buf, body) != body) break;
-
-        uint8_t key[32];
-        lockbox_derive_key(app, salt, key);
-        lockbox_cipher(key, buf, body);
-
-        /* Helyes PIN/eszkoz ellenorzese a MAGIC fejlec alapjan. */
-        if(memcmp(buf, LOCKBOX_MAGIC, LOCKBOX_MAGIC_LEN) != 0) break;
-
-        /* Eredeti nev: '/'-utani resz, vegerol a ".lbx" levagva. */
-        const char* base = strrchr(lbx_path, '/');
-        base = base ? base + 1 : lbx_path;
-        char inner[200];
-        snprintf(inner, sizeof(inner), "%s", base);
-        char* dot = strrchr(inner, '.');
-        if(dot && strcmp(dot, ".lbx") == 0) *dot = '\0';
-
-        const char* dest_dir = NFC_SRC_DIR;
-        size_t ilen = strlen(inner);
-        if(ilen >= 5 && strcmp(inner + ilen - 5, ".rfid") == 0) {
-            dest_dir = RFID_SRC_DIR;
-        } else if(ilen >= 4 && strcmp(inner + ilen - 4, ".sub") == 0) {
-            dest_dir = SUBGHZ_SRC_DIR;
-        } else if(ilen >= 5 && strcmp(inner + ilen - 5, ".ibtn") == 0) {
-            dest_dir = IBTN_SRC_DIR;
-        } else if(ilen >= 3 && strcmp(inner + ilen - 3, ".ir") == 0) {
-            dest_dir = INFRARED_SRC_DIR;
-        }
-        snprintf(out_dest, out_dest_sz, "%s/%s", dest_dir, inner);
-
-        if(!storage_file_open(dst, out_dest, FSAM_WRITE, FSOM_CREATE_ALWAYS)) break;
-        size_t plain = body - LOCKBOX_MAGIC_LEN;
-        if(storage_file_write(dst, buf + LOCKBOX_MAGIC_LEN, plain) != plain) break;
-
-        ok = true;
-    } while(false);
-
-    storage_file_close(src);
-    storage_file_free(src);
-    storage_file_close(dst);
+    if(storage_file_open(dst, out_dest, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        ok = (storage_file_write(dst, data, dlen) == dlen);
+        storage_file_close(dst);
+    }
     storage_file_free(dst);
-    if(buf) free(buf);
+    free(body);
 
     if(ok) storage_common_remove(app->storage, lbx_path);
     return ok;
@@ -918,10 +969,8 @@ static void item_menu_callback(void* context, uint32_t index);
 static void lockbox_start_rename(LockBoxApp* app);
 static void rename_done(void* context);
 
-/* Recovery PIN-pad megnyitasa (regi PIN bevitele). is_note dönti el, kartya
- * vagy jegyzet visszafejtesehez probaljuk. */
-static void lockbox_start_recover(LockBoxApp* app, bool is_note) {
-    app->recover_is_note = is_note;
+/* Recovery PIN-pad megnyitasa (regi PIN bevitele) a kivalasztott kartyahoz. */
+static void lockbox_start_recover(LockBoxApp* app) {
     app->use_recovery_pin = false;
     with_view_model(
         app->recover_view,
@@ -979,6 +1028,35 @@ static void lockbox_display_name(const char* path, char* out, size_t out_sz) {
     if(ll >= 4 && strcmp(out + ll - 4, ".lbx") == 0) out[ll - 4] = '\0';
 }
 
+/* Lista-nev: ha a fajlnev mar olvashato (ismert tipus-vegzodes), azt hasznaljuk
+ * (gyors). Ha "opak" (veletlen hex, regi formatum), visszafejtjuk a beagyazott
+ * valodi nevet -> igy a regi kartyak is a nevukon latszanak. */
+static void lockbox_item_display(LockBoxApp* app, const char* path, char* out, size_t out_sz) {
+    lockbox_display_name(path, out, out_sz);
+    size_t ll = strlen(out);
+    bool readable = (ll >= 4 && strcmp(out + ll - 4, ".nfc") == 0) ||
+                    (ll >= 5 && strcmp(out + ll - 5, ".rfid") == 0) ||
+                    (ll >= 4 && strcmp(out + ll - 4, ".sub") == 0) ||
+                    (ll >= 5 && strcmp(out + ll - 5, ".ibtn") == 0) ||
+                    (ll >= 3 && strcmp(out + ll - 3, ".ir") == 0);
+    if(readable) return;
+
+    bool saved = app->use_recovery_pin;
+    app->use_recovery_pin = false;
+    uint8_t* body = NULL;
+    size_t blen = 0;
+    if(lockbox_recover_body(app, path, &body, &blen)) {
+        char name[64];
+        const uint8_t* data = NULL;
+        size_t dlen = 0;
+        if(lockbox_parse_body(path, body, blen, name, sizeof(name), &data, &dlen) && name[0]) {
+            snprintf(out, out_sz, "%s", name);
+        }
+    }
+    if(body) free(body);
+    app->use_recovery_pin = saved;
+}
+
 static void lockbox_build_vault_menu(LockBoxApp* app) {
     lockbox_scan_vault(app);
     submenu_reset(app->vault_menu);
@@ -992,7 +1070,7 @@ static void lockbox_build_vault_menu(LockBoxApp* app) {
     } else {
         for(uint8_t i = 0; i < app->vault_count; i++) {
             char label[64];
-            lockbox_display_name(app->vault_paths[i], label, sizeof(label));
+            lockbox_item_display(app, app->vault_paths[i], label, sizeof(label));
             submenu_add_item(app->vault_menu, label, i, vault_menu_callback, app);
         }
     }
@@ -1000,8 +1078,8 @@ static void lockbox_build_vault_menu(LockBoxApp* app) {
 
 static void lockbox_build_item_menu(LockBoxApp* app) {
     submenu_reset(app->item_menu);
-    char hdr[32];
-    lockbox_display_name(app->vault_paths[app->selected_index], hdr, sizeof(hdr));
+    char hdr[64];
+    lockbox_item_display(app, app->vault_paths[app->selected_index], hdr, sizeof(hdr));
     submenu_set_header(app->item_menu, hdr);
     submenu_add_item(
         app->item_menu, "Decrypt (restore)", ItemActionDecrypt, item_menu_callback, app);
@@ -1029,7 +1107,7 @@ static void item_menu_callback(void* context, uint32_t index) {
 
     if(index == ItemActionOldPin) {
         /* Regi PIN-nel probaljuk visszafejteni ezt a kartyat. */
-        lockbox_start_recover(app, false);
+        lockbox_start_recover(app);
         return;
     }
 
@@ -1087,17 +1165,7 @@ static void item_menu_callback(void* context, uint32_t index) {
     view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdResult);
 }
 
-/* ====================================================================== *
- *                    Secure Notes — titkos jegyzetek                     *
- * ====================================================================== */
-
-static void notes_menu_callback(void* context, uint32_t index);
-static void note_item_menu_callback(void* context, uint32_t index);
-static void note_title_done(void* context);
-static void note_text_done(void* context);
-static void lockbox_build_notes_menu(LockBoxApp* app);
-
-/* Fajlnevbe nem valo karakterek cserelese. */
+/* Fajlnevbe nem valo karakterek cserelese (az atnevezes hasznalja). */
 static void lockbox_note_sanitize(const char* in, char* out, size_t out_sz) {
     size_t j = 0;
     for(size_t i = 0; in[i] && j < out_sz - 1; i++) {
@@ -1109,188 +1177,6 @@ static void lockbox_note_sanitize(const char* in, char* out, size_t out_sz) {
         out[j++] = ch;
     }
     out[j] = '\0';
-}
-
-static void lockbox_scan_notes(LockBoxApp* app) {
-    app->note_count = 0;
-    File* d = storage_file_alloc(app->storage);
-    if(storage_dir_open(d, LOCKBOX_NOTES_DIR)) {
-        FileInfo info;
-        char name[160];
-        while(app->note_count < LOCKBOX_MAX_ITEMS &&
-              storage_dir_read(d, &info, name, sizeof(name))) {
-            if(info.flags & FSF_DIRECTORY) continue;
-            size_t nlen = strlen(name);
-            if(nlen >= 4 && strcmp(name + nlen - 4, ".lbx") == 0) {
-                snprintf(
-                    app->note_paths[app->note_count],
-                    LOCKBOX_PATH_LEN,
-                    "%s/%s",
-                    LOCKBOX_NOTES_DIR,
-                    name);
-                app->note_count++;
-            }
-        }
-        storage_dir_close(d);
-    }
-    storage_file_free(d);
-}
-
-static void lockbox_build_notes_menu(LockBoxApp* app) {
-    lockbox_scan_notes(app);
-    submenu_reset(app->notes_menu);
-    char hdr[32];
-    snprintf(hdr, sizeof(hdr), "Secure Notes  (%u)", app->note_count);
-    submenu_set_header(app->notes_menu, hdr);
-    submenu_add_item(app->notes_menu, "+ New note", 0xFE, notes_menu_callback, app);
-    for(uint8_t i = 0; i < app->note_count; i++) {
-        char label[64];
-        lockbox_display_name(app->note_paths[i], label, sizeof(label));
-        submenu_add_item(app->notes_menu, label, i, notes_menu_callback, app);
-    }
-}
-
-static void lockbox_build_note_item_menu(LockBoxApp* app) {
-    submenu_reset(app->note_item_menu);
-    char hdr[32];
-    lockbox_display_name(app->note_paths[app->note_selected], hdr, sizeof(hdr));
-    submenu_set_header(app->note_item_menu, hdr);
-    submenu_add_item(app->note_item_menu, "View", NoteActionView, note_item_menu_callback, app);
-    /* "View with old PIN" csak akkor kell, ha a JELENLEGI PIN-nel nem nyithato. */
-    if(!lockbox_can_decrypt(app, app->note_paths[app->note_selected])) {
-        submenu_add_item(
-            app->note_item_menu,
-            "View with old PIN",
-            NoteActionOldPin,
-            note_item_menu_callback,
-            app);
-    }
-    submenu_add_item(
-        app->note_item_menu, "Delete", NoteActionDelete, note_item_menu_callback, app);
-}
-
-static void lockbox_start_new_note(LockBoxApp* app) {
-    app->note_title[0] = '\0';
-    text_input_reset(app->title_input);
-    text_input_set_header_text(app->title_input, "Note title");
-    text_input_set_result_callback(
-        app->title_input,
-        note_title_done,
-        app,
-        app->note_title,
-        sizeof(app->note_title),
-        true);
-    view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdTitleInput);
-}
-
-static void note_title_done(void* context) {
-    LockBoxApp* app = context;
-    if(strlen(app->note_title) == 0) {
-        lockbox_build_notes_menu(app);
-        view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdNotes);
-        return;
-    }
-    app->note_text[0] = '\0';
-    text_input_reset(app->note_input);
-    text_input_set_header_text(app->note_input, "Note text");
-    text_input_set_result_callback(
-        app->note_input, note_text_done, app, app->note_text, sizeof(app->note_text), true);
-    view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdNoteInput);
-}
-
-static void note_text_done(void* context) {
-    LockBoxApp* app = context;
-    char safe[LOCKBOX_NOTE_TITLE_LEN];
-    lockbox_note_sanitize(app->note_title, safe, sizeof(safe));
-
-    storage_common_mkdir(app->storage, LOCKBOX_DIR);
-    storage_common_mkdir(app->storage, LOCKBOX_NOTES_DIR);
-    char path[LOCKBOX_PATH_LEN];
-    snprintf(path, sizeof(path), "%s/%s.lbx", LOCKBOX_NOTES_DIR, safe);
-
-    bool ok = lockbox_encrypt_to_file(
-        app, path, (const uint8_t*)app->note_text, strlen(app->note_text));
-    snprintf(
-        app->result_buffer,
-        sizeof(app->result_buffer),
-        "Note %s\n"
-        "----------------\n"
-        "Title: %s\n\n"
-        "%s",
-        ok ? "saved" : "FAILED",
-        app->note_title,
-        ok ? "Encrypted and stored in\nthe vault (device-bound)." :
-             "Could not save the note.");
-    notification_message(app->notifications, ok ? &sequence_success : &sequence_error);
-
-    lockbox_build_notes_menu(app);
-    text_box_set_text(app->result_box, app->result_buffer);
-    view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdResult);
-}
-
-static void notes_menu_callback(void* context, uint32_t index) {
-    LockBoxApp* app = context;
-    if(index == 0xFE) {
-        lockbox_start_new_note(app);
-        return;
-    }
-    app->note_selected = (uint8_t)index;
-    lockbox_build_note_item_menu(app);
-    view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdNoteItem);
-}
-
-static void note_item_menu_callback(void* context, uint32_t index) {
-    LockBoxApp* app = context;
-    const char* path = app->note_paths[app->note_selected];
-
-    if(index == NoteActionOldPin) {
-        /* Regi PIN-nel probaljuk megnyitni ezt a jegyzetet. */
-        lockbox_start_recover(app, true);
-        return;
-    }
-
-    if(index == NoteActionView) {
-        char title[64];
-        lockbox_display_name(path, title, sizeof(title));
-        char body[LOCKBOX_NOTE_TEXT_LEN] = {0};
-        bool ok = lockbox_decrypt_from_file(app, path, body, sizeof(body));
-        if(ok) {
-            snprintf(
-                app->note_display,
-                sizeof(app->note_display),
-                "%s\n----------------\n%s",
-                title,
-                body);
-        } else {
-            snprintf(
-                app->note_display,
-                sizeof(app->note_display),
-                "%s\n----------------\nCannot decrypt (wrong PIN\nor wrong Flipper).",
-                title);
-        }
-        text_box_set_text(app->note_view, app->note_display);
-        text_box_set_focus(app->note_view, TextBoxFocusStart);
-        view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdNoteView);
-    } else { /* NoteActionDelete */
-        FS_Error err = storage_common_remove(app->storage, path);
-        bool ok = (err == FSE_OK);
-        char nm[64];
-        lockbox_display_name(path, nm, sizeof(nm));
-        snprintf(
-            app->result_buffer,
-            sizeof(app->result_buffer),
-            "Delete %s\n"
-            "----------------\n"
-            "Note: %s\n\n"
-            "%s",
-            ok ? "OK" : "FAILED",
-            nm,
-            ok ? "Removed from the vault." : "Could not delete.");
-        notification_message(app->notifications, ok ? &sequence_success : &sequence_error);
-        lockbox_build_notes_menu(app);
-        text_box_set_text(app->result_box, app->result_buffer);
-        view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdResult);
-    }
 }
 
 /* ====================================================================== *
@@ -1482,15 +1368,19 @@ static void pin_view_draw_callback(Canvas* canvas, void* model) {
         const char* b = " to close app";
         uint16_t wa = canvas_string_width(canvas, a);
         uint16_t wb = canvas_string_width(canvas, b);
-        const uint16_t warrow = 8;
+        const uint16_t warrow = 11;
         int sx = (128 - (int)(wa + warrow + wb)) / 2;
         if(sx < 0) sx = 0;
         canvas_draw_str(canvas, sx, 63, a);
+        /* "Vissza" (return) ikon: balra mutato hegy + jobboldalt felfele szar. */
         int ax = sx + wa + 1;
         int ay = 60;
-        canvas_draw_line(canvas, ax, ay, ax + 5, ay);
-        canvas_draw_line(canvas, ax, ay, ax + 2, ay - 2);
-        canvas_draw_line(canvas, ax, ay, ax + 2, ay + 2);
+        canvas_draw_line(canvas, ax, ay, ax + 7, ay); /* vizszintes szar */
+        canvas_draw_line(canvas, ax, ay + 1, ax + 7, ay + 1); /* vastagitas */
+        canvas_draw_line(canvas, ax + 7, ay + 1, ax + 7, ay - 5); /* jobb oldali szar felfele */
+        canvas_draw_line(canvas, ax + 6, ay + 1, ax + 6, ay - 5); /* vastagitas */
+        canvas_draw_line(canvas, ax, ay, ax + 3, ay - 3); /* nyilhegy felso */
+        canvas_draw_line(canvas, ax, ay + 1, ax + 3, ay + 4); /* nyilhegy also */
         canvas_draw_str(canvas, sx + wa + warrow, 63, b);
     } else {
         canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, "Hold Back to cancel");
@@ -1517,7 +1407,7 @@ static void lockbox_lock_timer_callback(void* context) {
 static void lockbox_update_menu_header(LockBoxApp* app) {
     lockbox_scan_vault(app);
     snprintf(
-        app->menu_header, sizeof(app->menu_header), "LockBox  -  %u cards", app->vault_count);
+        app->menu_header, sizeof(app->menu_header), "LockBox  -  %u Files", app->vault_count);
     submenu_set_header(app->menu, app->menu_header);
 }
 
@@ -1636,6 +1526,7 @@ static bool pin_view_input_callback(InputEvent* event, void* context) {
             bool pin_changed = was_changing && !pin_equal(&entered, &app->old_pin_for_rekey);
             lockbox_pin_save(app, &entered);
             app->session_pin = entered;
+            app->session_master_valid = false; /* uj PIN -> mester-kulcs ujraszamitas */
             app->changing_pin = false;
             /* Uj PIN -> a hibaszamlalo es a zarolas nullazodik. */
             app->fail_count = 0;
@@ -1665,6 +1556,7 @@ static bool pin_view_input_callback(InputEvent* event, void* context) {
              * egy kesobbi rossz PIN megint elolrol kezdi a zarolas-idozitest. */
             lockbox_lock_reset(app);
             app->session_pin = entered;
+            app->session_master_valid = false; /* uj munkamenet -> mester-kulcs ujraszamitas */
             notification_message(app->notifications, &sequence_success);
             lockbox_show_menu(app);
         } else {
@@ -1719,55 +1611,30 @@ static bool pin_view_input_callback(InputEvent* event, void* context) {
  * ====================================================================== */
 
 /* A recover_view-ban megadott regi PIN-nel megprobalja visszafejteni a kivalasztott
- * kartyat vagy jegyzetet. Siker -> helyreallitas/megtekintes; hiba -> "wrong PIN". */
+ * kartyat. Siker -> helyreallitas; hiba -> "wrong PIN". */
 static void lockbox_try_recover(LockBoxApp* app, const PinVal* oldpin) {
     app->recovery_pin = *oldpin;
     app->use_recovery_pin = true;
 
-    bool ok = false;
-    if(app->recover_is_note) {
-        const char* path = app->note_paths[app->note_selected];
-        char title[64];
-        lockbox_display_name(path, title, sizeof(title));
-        char body[LOCKBOX_NOTE_TEXT_LEN] = {0};
-        ok = lockbox_decrypt_from_file(app, path, body, sizeof(body));
-        if(ok) {
-            snprintf(
-                app->note_display,
-                sizeof(app->note_display),
-                "%s\n----------------\n%s",
-                title,
-                body);
-        }
-        app->use_recovery_pin = false;
-        if(ok) {
-            text_box_set_text(app->note_view, app->note_display);
-            text_box_set_focus(app->note_view, TextBoxFocusStart);
-            notification_message(app->notifications, &sequence_success);
-            view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdNoteView);
-            return;
-        }
-    } else {
-        const char* path = app->vault_paths[app->selected_index];
-        char dest[256] = {0};
-        ok = lockbox_decrypt(app, path, dest, sizeof(dest));
-        app->use_recovery_pin = false;
-        if(ok) {
-            snprintf(
-                app->result_buffer,
-                sizeof(app->result_buffer),
-                "Recovered with old PIN\n"
-                "----------------\n"
-                "Restored to:\n%s\n\n"
-                "Back in its app and\nremoved from the vault.",
-                dest);
-            lockbox_build_vault_menu(app);
-            lockbox_update_menu_header(app);
-            text_box_set_text(app->result_box, app->result_buffer);
-            notification_message(app->notifications, &sequence_success);
-            view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdResult);
-            return;
-        }
+    const char* path = app->vault_paths[app->selected_index];
+    char dest[256] = {0};
+    bool ok = lockbox_decrypt(app, path, dest, sizeof(dest));
+    app->use_recovery_pin = false;
+    if(ok) {
+        snprintf(
+            app->result_buffer,
+            sizeof(app->result_buffer),
+            "Recovered with old PIN\n"
+            "----------------\n"
+            "Restored to:\n%s\n\n"
+            "Back in its app and\nremoved from the vault.",
+            dest);
+        lockbox_build_vault_menu(app);
+        lockbox_update_menu_header(app);
+        text_box_set_text(app->result_box, app->result_buffer);
+        notification_message(app->notifications, &sequence_success);
+        view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdResult);
+        return;
     }
 
     /* Nem sikerult -> hiba a recovery paden, ujra lehet probalni. */
@@ -1788,8 +1655,7 @@ static bool recover_pin_input_callback(InputEvent* event, void* context) {
     /* HOSSZU Back = megse (vissza a muvelet-menube). A rovid Back viszont PIN-
      * szimbolum, mert a regi PIN tartalmazhat Back-et. */
     if(event->key == InputKeyBack && event->type == InputTypeLong) {
-        view_dispatcher_switch_to_view(
-            app->view_dispatcher, app->recover_is_note ? ViewIdNoteItem : ViewIdItem);
+        view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdItem);
         return true;
     }
 
@@ -1864,13 +1730,6 @@ static void lockbox_rekey_all(LockBoxApp* app, uint32_t* done, uint32_t* fail) {
         else
             (*fail)++;
     }
-    lockbox_scan_notes(app);
-    for(uint8_t i = 0; i < app->note_count; i++) {
-        if(lockbox_rekey_file(app, app->note_paths[i]))
-            (*done)++;
-        else
-            (*fail)++;
-    }
 }
 
 static void rekey_menu_callback(void* context, uint32_t index) {
@@ -1918,14 +1777,19 @@ static void settings_menu_callback(void* context, uint32_t index);
 
 static void lockbox_build_settings_menu(LockBoxApp* app) {
     submenu_reset(app->settings_menu);
-    submenu_set_header(app->settings_menu, "Panic Wipe");
-    char l1[40], l2[40], l3[40];
+    submenu_set_header(app->settings_menu, "Settings");
+    char l1[40];
     snprintf(l1, sizeof(l1), "Panic wipe: %s", app->panic_enabled ? "ON" : "OFF");
-    snprintf(l2, sizeof(l2), "Wipe after  -   (%u)", (unsigned)app->panic_threshold);
-    snprintf(l3, sizeof(l3), "Wipe after  +   (%u)", (unsigned)app->panic_threshold);
     submenu_add_item(app->settings_menu, l1, SettingsPanicToggle, settings_menu_callback, app);
-    submenu_add_item(app->settings_menu, l2, SettingsPanicLess, settings_menu_callback, app);
-    submenu_add_item(app->settings_menu, l3, SettingsPanicMore, settings_menu_callback, app);
+    /* A kuszob csak akkor latszik/allithato, ha a panic wipe BE van kapcsolva. */
+    if(app->panic_enabled) {
+        char l2[40], l3[40];
+        snprintf(l2, sizeof(l2), "Wipe after  -   (%u)", (unsigned)app->panic_threshold);
+        snprintf(l3, sizeof(l3), "Wipe after  +   (%u)", (unsigned)app->panic_threshold);
+        submenu_add_item(app->settings_menu, l2, SettingsPanicLess, settings_menu_callback, app);
+        submenu_add_item(app->settings_menu, l3, SettingsPanicMore, settings_menu_callback, app);
+    }
+    submenu_add_item(app->settings_menu, "Change PIN", SettingsChangePin, settings_menu_callback, app);
     submenu_add_item(app->settings_menu, "Back", SettingsBack, settings_menu_callback, app);
 }
 
@@ -1941,6 +1805,21 @@ static void settings_menu_callback(void* context, uint32_t index) {
     case SettingsPanicMore:
         if(app->panic_threshold < PANIC_WIPE_MAX) app->panic_threshold++;
         break;
+    case SettingsChangePin:
+        /* PIN-valtas inditasa a Settingsbol. */
+        app->changing_pin = true;
+        app->old_pin_for_rekey = app->session_pin;
+        with_view_model(
+            app->pin_view,
+            PinModel * m,
+            {
+                m->mode = PinModeSet;
+                m->error = false;
+                pin_view_reset_entry(m);
+            },
+            true);
+        view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdPin);
+        return;
     case SettingsBack:
     default:
         lockbox_show_menu(app);
@@ -1949,6 +1828,108 @@ static void settings_menu_callback(void* context, uint32_t index) {
     lockbox_cfg_save(app);
     lockbox_build_settings_menu(app);
     submenu_set_selected_item(app->settings_menu, index);
+}
+
+/* ====================================================================== *
+ *                 Encrypt ALL — minden fajl egy gombbal                  *
+ * ====================================================================== */
+
+/* Egy forrasmappa osszes (ext-re vegzodo) fajljanak betitkositasa a szefbe. */
+static void lockbox_encrypt_all_dir(
+    LockBoxApp* app,
+    const char* src_dir,
+    const char* ext,
+    const char* vault_dir,
+    uint32_t* done,
+    uint32_t* fail) {
+    /* A neveket eloszor osszegyujtjuk (heap-en, nem stacken), mert az import
+     * torli a forrast -> a konyvtar-bejarast nem zavarhatja. */
+    char(*names)[160] = malloc(sizeof(char[LOCKBOX_MAX_ITEMS][160]));
+    if(!names) return;
+    uint32_t count = 0;
+    size_t elen = strlen(ext);
+
+    File* d = storage_file_alloc(app->storage);
+    if(storage_dir_open(d, src_dir)) {
+        FileInfo info;
+        char name[160];
+        while(count < LOCKBOX_MAX_ITEMS && storage_dir_read(d, &info, name, sizeof(name))) {
+            if(info.flags & FSF_DIRECTORY) continue;
+            size_t nl = strlen(name);
+            if(nl >= elen && strcmp(name + nl - elen, ext) == 0) {
+                snprintf(names[count], 160, "%s", name);
+                count++;
+            }
+        }
+        storage_dir_close(d);
+    }
+    storage_file_free(d);
+
+    for(uint32_t i = 0; i < count; i++) {
+        char src[LOCKBOX_PATH_LEN];
+        snprintf(src, sizeof(src), "%s/%s", src_dir, names[i]);
+        bool removed = false;
+        if(lockbox_import(app, src, vault_dir, &removed))
+            (*done)++;
+        else
+            (*fail)++;
+    }
+    free(names);
+}
+
+/* Minden tipus osszes fajljanak betitkositasa a szefbe (NFC/RFID/SubGHz/iButton/IR). */
+static void lockbox_encrypt_all(LockBoxApp* app) {
+    uint32_t done = 0, fail = 0;
+    lockbox_encrypt_all_dir(app, NFC_SRC_DIR, ".nfc", LOCKBOX_NFC_DIR, &done, &fail);
+    lockbox_encrypt_all_dir(app, RFID_SRC_DIR, ".rfid", LOCKBOX_RFID_DIR, &done, &fail);
+    lockbox_encrypt_all_dir(app, SUBGHZ_SRC_DIR, ".sub", LOCKBOX_SUBGHZ_DIR, &done, &fail);
+    lockbox_encrypt_all_dir(app, IBTN_SRC_DIR, ".ibtn", LOCKBOX_IBTN_DIR, &done, &fail);
+    lockbox_encrypt_all_dir(app, INFRARED_SRC_DIR, ".ir", LOCKBOX_INFRARED_DIR, &done, &fail);
+
+    snprintf(
+        app->result_buffer,
+        sizeof(app->result_buffer),
+        "Encrypt ALL %s\n"
+        "----------------\n"
+        "%u file(s) encrypted\n"
+        "%u failed\n\n"
+        "All moved into the vault\nand removed from their apps.",
+        fail ? "done" : "OK",
+        (unsigned)done,
+        (unsigned)fail);
+    notification_message(app->notifications, fail ? &sequence_error : &sequence_success);
+    lockbox_update_menu_header(app);
+    text_box_set_text(app->result_box, app->result_buffer);
+    view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdResult);
+}
+
+/* A szef OSSZES tetelenek visszafejtese a sajat appjaba (az Encrypt ALL parja). */
+static void lockbox_decrypt_all(LockBoxApp* app) {
+    lockbox_scan_vault(app);
+    uint8_t count = app->vault_count;
+    uint32_t done = 0, fail = 0;
+    for(uint8_t i = 0; i < count; i++) {
+        char dest[256];
+        if(lockbox_decrypt(app, app->vault_paths[i], dest, sizeof(dest)))
+            done++;
+        else
+            fail++;
+    }
+    snprintf(
+        app->result_buffer,
+        sizeof(app->result_buffer),
+        "Decrypt ALL %s\n"
+        "----------------\n"
+        "%u file(s) restored\n"
+        "%u failed\n\n"
+        "Files are back in their\napps and left the vault.",
+        fail ? "done" : "OK",
+        (unsigned)done,
+        (unsigned)fail);
+    notification_message(app->notifications, fail ? &sequence_error : &sequence_success);
+    lockbox_update_menu_header(app);
+    text_box_set_text(app->result_box, app->result_buffer);
+    view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdResult);
 }
 
 /* ====================================================================== *
@@ -1973,33 +1954,19 @@ static void menu_callback(void* context, uint32_t index) {
     case MenuIndexInfrared:
         lockbox_import_flow(app, INFRARED_SRC_DIR, ".ir", LOCKBOX_INFRARED_DIR, "Infrared");
         break;
+    case MenuIndexEncryptAll:
+        lockbox_encrypt_all(app);
+        break;
+    case MenuIndexDecryptAll:
+        lockbox_decrypt_all(app);
+        break;
     case MenuIndexVault:
         lockbox_build_vault_menu(app);
         view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdVault);
         break;
-    case MenuIndexNotes:
-        lockbox_build_notes_menu(app);
-        view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdNotes);
-        break;
     case MenuIndexSettings:
         lockbox_build_settings_menu(app);
         view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdSettings);
-        break;
-    case MenuIndexChangePin:
-        /* Jeloljuk, hogy PIN-valtas folyik, es elmentjuk a mostani (regi) PIN-t
-         * az esetleges ujratitkositashoz. */
-        app->changing_pin = true;
-        app->old_pin_for_rekey = app->session_pin;
-        with_view_model(
-            app->pin_view,
-            PinModel * m,
-            {
-                m->mode = PinModeSet;
-                m->error = false;
-                pin_view_reset_entry(m);
-            },
-            true);
-        view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdPin);
         break;
     case MenuIndexAbout:
         view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdAbout);
@@ -2023,20 +1990,10 @@ static uint32_t view_to_vault(void* context) {
     return ViewIdVault;
 }
 
-static uint32_t view_to_notes(void* context) {
-    UNUSED(context);
-    return ViewIdNotes;
-}
-
-static uint32_t view_to_note_item(void* context) {
-    UNUSED(context);
-    return ViewIdNoteItem;
-}
-
-/* A recovery padrol a Back a megfelelo muvelet-menure visz vissza. */
+/* A recovery padrol a Back a kartya-muvelet-menure visz vissza. */
 static uint32_t view_recover_previous(void* context) {
-    LockBoxApp* app = context;
-    return app->recover_is_note ? ViewIdNoteItem : ViewIdItem;
+    UNUSED(context);
+    return ViewIdItem;
 }
 
 static bool lockbox_navigation_callback(void* context) {
@@ -2093,10 +2050,10 @@ static LockBoxApp* lockbox_app_alloc(void) {
     submenu_add_item(app->menu, "Encrypt SubGHz", MenuIndexSubghz, menu_callback, app);
     submenu_add_item(app->menu, "Encrypt iButton", MenuIndexIbtn, menu_callback, app);
     submenu_add_item(app->menu, "Encrypt Infrared", MenuIndexInfrared, menu_callback, app);
+    submenu_add_item(app->menu, "Encrypt ALL files", MenuIndexEncryptAll, menu_callback, app);
+    submenu_add_item(app->menu, "Decrypt ALL files", MenuIndexDecryptAll, menu_callback, app);
     submenu_add_item(app->menu, "My Vault", MenuIndexVault, menu_callback, app);
-    submenu_add_item(app->menu, "Secure Notes", MenuIndexNotes, menu_callback, app);
     submenu_add_item(app->menu, "Settings", MenuIndexSettings, menu_callback, app);
-    submenu_add_item(app->menu, "Change PIN", MenuIndexChangePin, menu_callback, app);
     submenu_add_item(app->menu, "About", MenuIndexAbout, menu_callback, app);
     view_dispatcher_add_view(app->view_dispatcher, ViewIdMenu, submenu_get_view(app->menu));
 
@@ -2114,34 +2071,6 @@ static LockBoxApp* lockbox_app_alloc(void) {
     app->rekey_menu = submenu_alloc();
     view_set_previous_callback(submenu_get_view(app->rekey_menu), view_to_menu);
     view_dispatcher_add_view(app->view_dispatcher, ViewIdRekey, submenu_get_view(app->rekey_menu));
-
-    /* Secure Notes: lista */
-    app->notes_menu = submenu_alloc();
-    view_set_previous_callback(submenu_get_view(app->notes_menu), view_to_menu);
-    view_dispatcher_add_view(app->view_dispatcher, ViewIdNotes, submenu_get_view(app->notes_menu));
-
-    /* Jegyzet-muvelet almenu (View / Delete) */
-    app->note_item_menu = submenu_alloc();
-    view_set_previous_callback(submenu_get_view(app->note_item_menu), view_to_notes);
-    view_dispatcher_add_view(
-        app->view_dispatcher, ViewIdNoteItem, submenu_get_view(app->note_item_menu));
-
-    /* Jegyzet megtekinto (visszafejtett szoveg) */
-    app->note_view = text_box_alloc();
-    view_set_previous_callback(text_box_get_view(app->note_view), view_to_note_item);
-    view_dispatcher_add_view(
-        app->view_dispatcher, ViewIdNoteView, text_box_get_view(app->note_view));
-
-    /* Jegyzet cim + szoveg bevitel */
-    app->title_input = text_input_alloc();
-    view_set_previous_callback(text_input_get_view(app->title_input), view_to_notes);
-    view_dispatcher_add_view(
-        app->view_dispatcher, ViewIdTitleInput, text_input_get_view(app->title_input));
-
-    app->note_input = text_input_alloc();
-    view_set_previous_callback(text_input_get_view(app->note_input), view_to_notes);
-    view_dispatcher_add_view(
-        app->view_dispatcher, ViewIdNoteInput, text_input_get_view(app->note_input));
 
     /* Atnevezes bevitel (a szef-tetel muvelet-menujebol) */
     app->rename_input = text_input_alloc();
@@ -2163,8 +2092,7 @@ static LockBoxApp* lockbox_app_alloc(void) {
         "LockBox %s\n"
         "----------------\n"
         "Device-bound vault for NFC,\n"
-        "RFID, SubGHz, iButton & IR,\n"
-        "plus Secure Notes.\n\n"
+        "RFID, SubGHz, iButton & IR.\n\n"
         "Key = THIS Flipper's serial\n"
         "+ your PIN (SHA-256 KDF).\n"
         "Never stored. A copied .lbx\n"
@@ -2173,11 +2101,12 @@ static LockBoxApp* lockbox_app_alloc(void) {
         "Encrypt: pick a file; it is\n"
         "locked into the vault and\n"
         "removed from its app.\n\n"
+        "Encrypt/Decrypt ALL files\n"
+        "moves everything at once.\n\n"
         "My Vault: decrypt, rename\n"
         "or delete stored items.\n\n"
-        "Secure Notes: store text or\n"
-        "passwords, encrypted too.\n\n"
-        "Settings - Panic Wipe erases\n"
+        "Settings - Change PIN, and\n"
+        "Panic Wipe erases\n"
         "the vault after N wrong PINs\n"
         "(OFF by default).\n\n"
         "Wrong PIN locks you out,\n"
@@ -2202,11 +2131,9 @@ static LockBoxApp* lockbox_app_alloc(void) {
 static void lockbox_app_free(LockBoxApp* app) {
     /* Erzekeny adatok torlese a memoriabol. */
     memset(&app->session_pin, 0, sizeof(app->session_pin));
+    memset(app->session_master, 0, sizeof(app->session_master));
     memset(&app->recovery_pin, 0, sizeof(app->recovery_pin));
     memset(&app->old_pin_for_rekey, 0, sizeof(app->old_pin_for_rekey));
-    memset(app->note_title, 0, sizeof(app->note_title));
-    memset(app->note_text, 0, sizeof(app->note_text));
-    memset(app->note_display, 0, sizeof(app->note_display));
 
     view_dispatcher_remove_view(app->view_dispatcher, ViewIdPin);
     view_dispatcher_remove_view(app->view_dispatcher, ViewIdRecoverPin);
@@ -2214,11 +2141,6 @@ static void lockbox_app_free(LockBoxApp* app) {
     view_dispatcher_remove_view(app->view_dispatcher, ViewIdVault);
     view_dispatcher_remove_view(app->view_dispatcher, ViewIdItem);
     view_dispatcher_remove_view(app->view_dispatcher, ViewIdRekey);
-    view_dispatcher_remove_view(app->view_dispatcher, ViewIdNotes);
-    view_dispatcher_remove_view(app->view_dispatcher, ViewIdNoteItem);
-    view_dispatcher_remove_view(app->view_dispatcher, ViewIdNoteView);
-    view_dispatcher_remove_view(app->view_dispatcher, ViewIdTitleInput);
-    view_dispatcher_remove_view(app->view_dispatcher, ViewIdNoteInput);
     view_dispatcher_remove_view(app->view_dispatcher, ViewIdRenameInput);
     view_dispatcher_remove_view(app->view_dispatcher, ViewIdSettings);
     view_dispatcher_remove_view(app->view_dispatcher, ViewIdAbout);
@@ -2230,14 +2152,9 @@ static void lockbox_app_free(LockBoxApp* app) {
     submenu_free(app->vault_menu);
     submenu_free(app->item_menu);
     submenu_free(app->rekey_menu);
-    submenu_free(app->notes_menu);
-    submenu_free(app->note_item_menu);
     submenu_free(app->settings_menu);
     text_box_free(app->about_box);
     text_box_free(app->result_box);
-    text_box_free(app->note_view);
-    text_input_free(app->title_input);
-    text_input_free(app->note_input);
     text_input_free(app->rename_input);
 
     furi_timer_stop(app->lock_timer);
