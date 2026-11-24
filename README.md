@@ -10,8 +10,6 @@ files, so a stolen SD card or a copied file is useless on any other device.
 
 - **Encrypt NFC / RFID / SubGHz / iButton / Infrared** — pick a file; it is encrypted
   into the vault (`.lbx`) and removed from its original app.
-- **Encrypt ALL / Decrypt ALL files** — move everything into, or back out of, the vault
-  in one tap.
 - **My Vault** — list stored items, decrypt (restore) them back to their app, **rename**,
   or delete.
 - **Direction-button PIN** — a 4–6 long Up/Down/Left/Right/Back sequence, like the Momentum lock code.

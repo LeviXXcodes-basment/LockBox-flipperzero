@@ -28,7 +28,7 @@
 #include <dialogs/dialogs.h>
 #include <notification/notification_messages.h>
 
-#define APP_VERSION "v2.3"
+#define APP_VERSION "v2.4"
 
 #define LOCKBOX_DIR      "/ext/apps_data/lockbox"
 #define LOCKBOX_PIN_PATH  "/ext/apps_data/lockbox/pin.dat"
@@ -207,8 +207,6 @@ typedef enum {
     MenuIndexSubghz,
     MenuIndexIbtn,
     MenuIndexInfrared,
-    MenuIndexEncryptAll,
-    MenuIndexDecryptAll,
     MenuIndexVault,
     MenuIndexSettings,
     MenuIndexAbout,
@@ -1831,108 +1829,6 @@ static void settings_menu_callback(void* context, uint32_t index) {
 }
 
 /* ====================================================================== *
- *                 Encrypt ALL — minden fajl egy gombbal                  *
- * ====================================================================== */
-
-/* Egy forrasmappa osszes (ext-re vegzodo) fajljanak betitkositasa a szefbe. */
-static void lockbox_encrypt_all_dir(
-    LockBoxApp* app,
-    const char* src_dir,
-    const char* ext,
-    const char* vault_dir,
-    uint32_t* done,
-    uint32_t* fail) {
-    /* A neveket eloszor osszegyujtjuk (heap-en, nem stacken), mert az import
-     * torli a forrast -> a konyvtar-bejarast nem zavarhatja. */
-    char(*names)[160] = malloc(sizeof(char[LOCKBOX_MAX_ITEMS][160]));
-    if(!names) return;
-    uint32_t count = 0;
-    size_t elen = strlen(ext);
-
-    File* d = storage_file_alloc(app->storage);
-    if(storage_dir_open(d, src_dir)) {
-        FileInfo info;
-        char name[160];
-        while(count < LOCKBOX_MAX_ITEMS && storage_dir_read(d, &info, name, sizeof(name))) {
-            if(info.flags & FSF_DIRECTORY) continue;
-            size_t nl = strlen(name);
-            if(nl >= elen && strcmp(name + nl - elen, ext) == 0) {
-                snprintf(names[count], 160, "%s", name);
-                count++;
-            }
-        }
-        storage_dir_close(d);
-    }
-    storage_file_free(d);
-
-    for(uint32_t i = 0; i < count; i++) {
-        char src[LOCKBOX_PATH_LEN];
-        snprintf(src, sizeof(src), "%s/%s", src_dir, names[i]);
-        bool removed = false;
-        if(lockbox_import(app, src, vault_dir, &removed))
-            (*done)++;
-        else
-            (*fail)++;
-    }
-    free(names);
-}
-
-/* Minden tipus osszes fajljanak betitkositasa a szefbe (NFC/RFID/SubGHz/iButton/IR). */
-static void lockbox_encrypt_all(LockBoxApp* app) {
-    uint32_t done = 0, fail = 0;
-    lockbox_encrypt_all_dir(app, NFC_SRC_DIR, ".nfc", LOCKBOX_NFC_DIR, &done, &fail);
-    lockbox_encrypt_all_dir(app, RFID_SRC_DIR, ".rfid", LOCKBOX_RFID_DIR, &done, &fail);
-    lockbox_encrypt_all_dir(app, SUBGHZ_SRC_DIR, ".sub", LOCKBOX_SUBGHZ_DIR, &done, &fail);
-    lockbox_encrypt_all_dir(app, IBTN_SRC_DIR, ".ibtn", LOCKBOX_IBTN_DIR, &done, &fail);
-    lockbox_encrypt_all_dir(app, INFRARED_SRC_DIR, ".ir", LOCKBOX_INFRARED_DIR, &done, &fail);
-
-    snprintf(
-        app->result_buffer,
-        sizeof(app->result_buffer),
-        "Encrypt ALL %s\n"
-        "----------------\n"
-        "%u file(s) encrypted\n"
-        "%u failed\n\n"
-        "All moved into the vault\nand removed from their apps.",
-        fail ? "done" : "OK",
-        (unsigned)done,
-        (unsigned)fail);
-    notification_message(app->notifications, fail ? &sequence_error : &sequence_success);
-    lockbox_update_menu_header(app);
-    text_box_set_text(app->result_box, app->result_buffer);
-    view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdResult);
-}
-
-/* A szef OSSZES tetelenek visszafejtese a sajat appjaba (az Encrypt ALL parja). */
-static void lockbox_decrypt_all(LockBoxApp* app) {
-    lockbox_scan_vault(app);
-    uint8_t count = app->vault_count;
-    uint32_t done = 0, fail = 0;
-    for(uint8_t i = 0; i < count; i++) {
-        char dest[256];
-        if(lockbox_decrypt(app, app->vault_paths[i], dest, sizeof(dest)))
-            done++;
-        else
-            fail++;
-    }
-    snprintf(
-        app->result_buffer,
-        sizeof(app->result_buffer),
-        "Decrypt ALL %s\n"
-        "----------------\n"
-        "%u file(s) restored\n"
-        "%u failed\n\n"
-        "Files are back in their\napps and left the vault.",
-        fail ? "done" : "OK",
-        (unsigned)done,
-        (unsigned)fail);
-    notification_message(app->notifications, fail ? &sequence_error : &sequence_success);
-    lockbox_update_menu_header(app);
-    text_box_set_text(app->result_box, app->result_buffer);
-    view_dispatcher_switch_to_view(app->view_dispatcher, ViewIdResult);
-}
-
-/* ====================================================================== *
  *                            Fomenu                                      *
  * ====================================================================== */
 
@@ -1953,12 +1849,6 @@ static void menu_callback(void* context, uint32_t index) {
         break;
     case MenuIndexInfrared:
         lockbox_import_flow(app, INFRARED_SRC_DIR, ".ir", LOCKBOX_INFRARED_DIR, "Infrared");
-        break;
-    case MenuIndexEncryptAll:
-        lockbox_encrypt_all(app);
-        break;
-    case MenuIndexDecryptAll:
-        lockbox_decrypt_all(app);
         break;
     case MenuIndexVault:
         lockbox_build_vault_menu(app);
@@ -2050,8 +1940,6 @@ static LockBoxApp* lockbox_app_alloc(void) {
     submenu_add_item(app->menu, "Encrypt SubGHz", MenuIndexSubghz, menu_callback, app);
     submenu_add_item(app->menu, "Encrypt iButton", MenuIndexIbtn, menu_callback, app);
     submenu_add_item(app->menu, "Encrypt Infrared", MenuIndexInfrared, menu_callback, app);
-    submenu_add_item(app->menu, "Encrypt ALL files", MenuIndexEncryptAll, menu_callback, app);
-    submenu_add_item(app->menu, "Decrypt ALL files", MenuIndexDecryptAll, menu_callback, app);
     submenu_add_item(app->menu, "My Vault", MenuIndexVault, menu_callback, app);
     submenu_add_item(app->menu, "Settings", MenuIndexSettings, menu_callback, app);
     submenu_add_item(app->menu, "About", MenuIndexAbout, menu_callback, app);
@@ -2101,8 +1989,6 @@ static LockBoxApp* lockbox_app_alloc(void) {
         "Encrypt: pick a file; it is\n"
         "locked into the vault and\n"
         "removed from its app.\n\n"
-        "Encrypt/Decrypt ALL files\n"
-        "moves everything at once.\n\n"
         "My Vault: decrypt, rename\n"
         "or delete stored items.\n\n"
         "Settings - Change PIN, and\n"
